@@ -580,6 +580,12 @@ class SecurityCouncil:
                     requires_approval=True,
                 )
 
+            # Hydration is read-only compatibility, not a way to resubmit an
+            # inadmissible command through the headless ALLOW path.
+            self._workflows[intent.intent_id] = workflow
+            inadmissible = self._refuse_inadmissible(workflow)
+            if inadmissible is not None:
+                return inadmissible
             workflow.transition_to(WorkflowState.APPROVED)
             workflow.approved_at = self._clock.now()
 
@@ -651,6 +657,10 @@ class SecurityCouncil:
                 error=f"Intent is not awaiting approval (state: {workflow.state.value})",
             )
 
+        inadmissible = self._refuse_inadmissible(workflow)
+        if inadmissible is not None:
+            return inadmissible
+
         result = self._quorum_manager.cast_vote(
             intent_id=intent_id,
             voter_id=voter_id,
@@ -662,6 +672,25 @@ class SecurityCouncil:
         workflow.vote_record = result.record
         self._apply_quorum_result(workflow, result.status, reason)
         return SubmitResult(success=True, workflow=workflow)
+
+    def _refuse_inadmissible(self, workflow: IntentWorkflow) -> SubmitResult | None:
+        """Deny a stored intent whose command no longer passes admission.
+
+        A record rehydrated from the shared store skips the admission ban so
+        history stays readable (``Intent.from_stored``); it must never become
+        executable. Re-check here, on the path every approval takes.
+        """
+        admission_error = Intent.command_admission_error(workflow.intent.command)
+        if admission_error is None:
+            return None
+        error = f"command no longer admissible: {admission_error}"
+        if workflow.state in (WorkflowState.EVALUATING, WorkflowState.AWAITING_APPROVAL):
+            workflow.transition_to(WorkflowState.DENIED)
+            workflow.denied_at = self._clock.now()
+            workflow.denial_reason = error
+            self._persist_workflow(workflow)
+        logger.warning("refusing intent %s: %s", workflow.intent_id, error)
+        return SubmitResult(success=False, workflow=workflow, error=error)
 
     def revise_vote(
         self,
@@ -691,6 +720,10 @@ class SecurityCouncil:
                 error=f"Intent is not awaiting approval (state: {workflow.state.value})",
             )
 
+        inadmissible = self._refuse_inadmissible(workflow)
+        if inadmissible is not None:
+            return inadmissible
+
         from nomos.level_2.quorum.vote import VoteType
 
         vt = VoteType.APPROVE if vote_type_str == "approve" else VoteType.DENY
@@ -715,6 +748,12 @@ class SecurityCouncil:
         workflow = self._workflows.get(intent_id)
         if workflow is None:
             return SubmitResult(success=False, error="Intent not found")
+
+        # Check historical terminal/approved workflows too: the idempotent
+        # success below must never authorize a command that fails admission.
+        inadmissible = self._refuse_inadmissible(workflow)
+        if inadmissible is not None:
+            return inadmissible
 
         if workflow.state != WorkflowState.AWAITING_APPROVAL:
             return SubmitResult(success=True, workflow=workflow)
@@ -774,6 +813,11 @@ class SecurityCouncil:
             return None
 
         intent = workflow.intent
+        if Intent.command_admission_error(intent.command) is not None:
+            logger.warning(
+                "refusing to mint for intent %s: command no longer admissible", intent_id
+            )
+            return None
         scope = CapabilityScope(
             action_type=intent.action_type,
             resource_pattern=intent.target_resource,
@@ -937,7 +981,20 @@ class SecurityCouncil:
                 for data in self._workflow_store.list_workflows_by_state(
                     [WorkflowState.AWAITING_APPROVAL.value]
                 ):
-                    workflow = IntentWorkflow.from_durable_dict(data)
+                    try:
+                        workflow = IntentWorkflow.from_durable_dict(data)
+                    except Exception:  # one bad record must not hide the rest
+                        stored_intent = data.get("intent")
+                        intent_id = (
+                            stored_intent.get("intent_id", "?")
+                            if isinstance(stored_intent, dict)
+                            else "?"
+                        )
+                        logger.warning(
+                            "skipping unreadable pending workflow %s",
+                            intent_id,
+                        )
+                        continue
                     pending.setdefault(workflow.intent_id, workflow)
             except Exception:  # listing falls back to local view
                 logger.warning("failed to list pending approvals from store")

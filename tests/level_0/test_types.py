@@ -370,6 +370,67 @@ class TestIntentValidation:
             )
         assert "dangerous pattern" in str(exc.value)
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "/bin/true\nrm -rf /tmp/x",
+            "/bin/true\r\nrm -rf /tmp/x",
+            "/bin/echo `bash -c id`",
+            "/bin/echo hi\x00",
+        ],
+        ids=["newline", "crlf", "backtick", "nul"],
+    )
+    def test_intent_rejects_control_characters(self, command):
+        """Newline, CR, NUL and backtick hide a second command from the policy lexers."""
+        with pytest.raises(ValidationError) as exc:
+            Intent.create(
+                agent_id="agent-1",
+                action_type="shell.exec",
+                description="control character in command",
+                target_resource="/tmp",
+                command=command,
+            )
+        assert "control character" in str(exc.value) or "backtick" in str(exc.value)
+
+    def test_stored_intent_with_control_characters_still_hydrates(self):
+        """A record that was valid when stored stays readable; fresh submission does not."""
+        legacy = Intent.create(
+            agent_id="agent-1",
+            action_type="shell.exec",
+            description="legacy record",
+            target_resource="/tmp",
+            command="/bin/true",
+        ).to_dict()
+        legacy["command"] = "/bin/true\nrm -rf /tmp/x"
+
+        hydrated = Intent.from_stored(legacy)
+        assert hydrated.command == "/bin/true\nrm -rf /tmp/x"
+        assert Intent.command_admission_error(hydrated.command) is not None
+        with pytest.raises(ValidationError):
+            Intent.from_dict(legacy)
+
+    def test_stored_intent_still_rejects_dangerous_patterns(self):
+        legacy = Intent.create(
+            agent_id="agent-1",
+            action_type="shell.exec",
+            description="legacy record",
+            target_resource="/tmp",
+            command="/bin/true",
+        ).to_dict()
+        legacy["command"] = "mkfs.ext4 /dev/sda1"
+        with pytest.raises(ValidationError):
+            Intent.from_stored(legacy)
+
+    def test_intent_accepts_pipeline_without_control_characters(self):
+        intent = Intent.create(
+            agent_id="agent-1",
+            action_type="shell.exec",
+            description="ordinary pipeline",
+            target_resource="/tmp",
+            command="/bin/cat /tmp/a | /bin/grep x && /bin/echo $(id -u)",
+        )
+        assert intent.command.startswith("/bin/cat")
+
     def test_invalid_namespace_format(self):
         """Test that Kubernetes namespace must be valid format."""
         with pytest.raises(ValidationError) as exc:
@@ -565,3 +626,54 @@ class TestRollbackPlanValidation:
         assert restored.strategy == RollbackStrategy.SNAPSHOT
         assert restored.estimated_duration_seconds == 120
         assert restored.artifacts["snapshot_id"] == "snap-123"
+
+
+@pytest.mark.parametrize("command_type", list(CommandType))
+@pytest.mark.parametrize("hidden", ["\r", "\n", "\x00", "`"])
+def test_admission_applies_to_all_command_types(command_type, hidden):
+    data = Intent.create(
+        agent_id="agent-1",
+        description="command admission matrix",
+        target_resource="/tmp",
+        command_type=command_type,
+        command="/bin/echo clean",
+    ).to_dict()
+    data["command"] = f"/bin/echo before{hidden}after"
+    with pytest.raises(ValidationError, match=r"control character|backtick"):
+        Intent.from_dict(data)
+    assert Intent.from_stored(data).command == data["command"]
+
+
+@pytest.mark.parametrize("command_type", list(CommandType))
+def test_clean_literal_control_spellings_remain_valid(command_type):
+    command = r"/bin/echo literal \n \r \x00"
+    intent = Intent.create(
+        agent_id="agent-1",
+        description="clean literal command control",
+        target_resource="/tmp",
+        command_type=command_type,
+        command=command,
+    )
+    assert Intent.from_stored(intent.to_dict()).command == command
+    assert Intent.from_dict(intent.to_dict()).command == command
+
+
+@pytest.mark.parametrize("command", ["/bin/echo clean", "/bin/echo legacy\nvalue"])
+def test_stored_hydration_preserves_structured_operation_consistency(command):
+    from nomos.level_0.types.tool_call import ToolCallRequest
+
+    operation = ToolCallRequest(
+        tool_name="example.read", arguments={}, subject="test-user"
+    ).to_operation()
+    intent = Intent.create(
+        agent_id="agent-1",
+        description="structured operation admission",
+        target_resource="tool",
+        operation=operation,
+    )
+    assert Intent.from_dict(intent.to_dict()).operation == operation
+    assert Intent.from_stored(intent.to_dict()).operation == operation
+    data = intent.to_dict()
+    data["command"] = command
+    with pytest.raises(ValidationError, match="structured operation cannot include a command"):
+        Intent.from_stored(data)
