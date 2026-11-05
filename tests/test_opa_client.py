@@ -87,6 +87,71 @@ def test_build_intent_filter_input_includes_normalized_path_references():
     assert "/app/keys/council.pub" in input_doc["intent"]["normalized_path_refs"]
 
 
+def test_build_intent_filter_input_keeps_partially_quoted_glob_active():
+    """Quoting is per character: ``"/etc/"shado?`` still expands, and a
+    mixed-quoted word elsewhere in the command must not disable detection."""
+    for command in ('/bin/cat "/etc/"shado?', '/bin/echo "hello"world; /bin/cat /etc/shado?'):
+        intent = Intent.create(
+            agent_id="agent-opa",
+            description="Read a file by pattern",
+            target_resource="/tmp",
+            command=command,
+            working_directory="/tmp",
+            justification="Testing glob references",
+            blast_radius="Read-only",
+        )
+        input_doc = build_intent_filter_input(intent, request_type="authorize", authenticated=True)
+        assert input_doc["intent"]["normalized_glob_refs"] == ["/etc/shado?"], command
+
+
+def test_build_intent_filter_input_joins_line_continuations():
+    intent = Intent.create(
+        agent_id="agent-opa",
+        description="Read a file by pattern",
+        target_resource="/tmp",
+        command="/bin/grep -r . /app/k\\\ne*",
+        working_directory="/tmp",
+        justification="Testing glob references",
+        blast_radius="Read-only",
+    )
+    input_doc = build_intent_filter_input(intent, request_type="authorize", authenticated=True)
+    assert input_doc["intent"]["normalized_glob_refs"] == ["/app/ke*"]
+
+
+def test_build_intent_filter_input_resolves_relative_glob_references():
+    intent = Intent.create(
+        agent_id="agent-opa",
+        description="Read a file by pattern",
+        target_resource="/etc",
+        command="/bin/cat shado?",
+        working_directory="/etc",
+        justification="Testing glob references",
+        blast_radius="Read-only",
+    )
+
+    input_doc = build_intent_filter_input(intent, request_type="authorize", authenticated=True)
+
+    assert input_doc["intent"]["normalized_glob_refs"] == ["/etc/shado?"]
+    assert "/etc/shado?" not in input_doc["intent"]["normalized_path_refs"]
+
+
+def test_build_intent_filter_input_keeps_quoted_metacharacters_literal():
+    intent = Intent.create(
+        agent_id="agent-opa",
+        description="Search a file",
+        target_resource="/tmp/work",
+        command="/bin/grep '.*' README.md",
+        working_directory="/tmp/work",
+        justification="Testing literal references",
+        blast_radius="Read-only",
+    )
+
+    input_doc = build_intent_filter_input(intent, request_type="authorize", authenticated=True)
+
+    assert input_doc["intent"]["normalized_glob_refs"] == []
+    assert "/tmp/work/.*" in input_doc["intent"]["normalized_path_refs"]
+
+
 def test_build_intent_filter_input_includes_council_opa_profile():
     intent = _make_intent()
     input_doc = build_intent_filter_input(
@@ -205,3 +270,26 @@ async def test_opa_http_client_posts_input_to_data_api():
     assert decision.decision_id == "decision-http"
     assert server.seen_path == "/v1/data/custom/intent/decision"
     assert server.seen_payload == {"input": {"intent": {"intent_id": "intent-http"}}}
+
+
+@pytest.mark.parametrize("count", [64, 65, 66])
+def test_build_intent_filter_input_brace_boundary(count):
+    alternatives = ",".join([*(f"safe{i}" for i in range(count - 1)), ".ssh"])
+    intent = Intent.create(
+        agent_id="agent-opa",
+        description="Check bounded brace normalization",
+        target_resource="/tmp",
+        command=f"/bin/cat /tmp/{{{alternatives}}}",
+        working_directory="/tmp",
+        justification="Testing bounded input shaping",
+        blast_radius="Read-only",
+    )
+    shaped = build_intent_filter_input(intent, request_type="authorize", authenticated=True)[
+        "intent"
+    ]
+    if count == 64:
+        assert shaped["normalized_glob_refs"] == []
+        assert "/tmp/.ssh" in shaped["normalized_path_refs"]
+    else:
+        assert shaped["normalized_glob_refs"] == ["/*"]
+        assert "/tmp/.ssh" not in shaped["normalized_path_refs"]
