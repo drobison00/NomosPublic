@@ -13,6 +13,7 @@ import os
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -699,6 +700,120 @@ class OPAConfig(BaseModel):
         return normalized
 
 
+GUARDRAILS_DEFAULT_CHANNELS = (
+    "description",
+    "justification",
+    "context",
+    "blast_radius",
+    "evidence",
+    "preceding_commands",
+    "rollback_steps",
+)
+
+
+class GuardrailsConfig(BaseModel):
+    """Optional per-council, screen-only NeMo input-rail evaluation.
+
+    The bundled model-free profile filters code-injection/context-bloat, not
+    general prompt injection. Command and packaged-file code are not screened.
+    """
+
+    enabled: bool = False
+    url: str = "http://localhost:8000"
+    config_id: str = "default-council"
+    timeout_ms: int = Field(default=2000, ge=1, le=60000)
+    fail_closed: bool = True
+    mode: str = "enforce"
+    channels: list[str] = Field(default_factory=lambda: list(GUARDRAILS_DEFAULT_CHANNELS))
+    max_input_bytes: int = Field(default=262144, ge=1, le=1048576)
+    max_response_bytes: int = Field(default=1048576, ge=1, le=4194304)
+    max_in_flight: int = Field(default=4, ge=1, le=64)
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_environment(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        defaults = {
+            "enabled": False,
+            "url": "http://localhost:8000",
+            "config_id": "default-council",
+            "timeout_ms": 2000,
+            "fail_closed": True,
+            "mode": "enforce",
+            "channels": list(GUARDRAILS_DEFAULT_CHANNELS),
+            "max_input_bytes": 262144,
+            "max_response_bytes": 1048576,
+            "max_in_flight": 4,
+        }
+        result = dict(value)
+        for name, default in defaults.items():
+            if name in result:
+                original = result[name]
+                result[name] = _resolve_env_reference(original, default)
+                if name == "channels" and isinstance(original, str) and original.startswith("${"):
+                    resolved = result[name]
+                    if isinstance(resolved, str):
+                        result[name] = yaml.safe_load(resolved)
+        return result
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        try:
+            parts = urlsplit(value)
+            valid = (
+                parts.scheme in {"http", "https"}
+                and bool(parts.hostname)
+                and parts.username is None
+                and parts.password is None
+                and "?" not in value
+                and "#" not in value
+                and not any(character.isspace() for character in value)
+            )
+            _ = parts.port
+        except ValueError as exc:
+            raise ValueError("Guardrails url must be a valid HTTP(S) endpoint") from exc
+        if not valid:
+            raise ValueError(
+                "Guardrails url requires an HTTP(S) host without credentials/query/fragment"
+            )
+        return value
+
+    @field_validator("config_id")
+    @classmethod
+    def validate_config_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Guardrails config_id must not be empty")
+        return value
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value not in {"enforce", "shadow"}:
+            raise ValueError("Guardrails mode must be enforce or shadow")
+        return value
+
+    @field_validator("channels")
+    @classmethod
+    def validate_channels(cls, values: list[str]) -> list[str]:
+        result: list[str] = []
+        for value in values:
+            value = value.strip()
+            if not value:
+                continue
+            if value not in GUARDRAILS_DEFAULT_CHANNELS:
+                raise ValueError("Unknown Guardrails prose channel")
+            if value not in result:
+                result.append(value)
+        if not result:
+            raise ValueError("Guardrails channels must not be empty")
+        return result
+
+
 class TelemetryConfig(BaseModel):
     """Internal telemetry delivery for monitor-only council latency metrics."""
 
@@ -792,6 +907,10 @@ class CouncilSettings(BaseModel):
     opa: OPAConfig = Field(
         default_factory=OPAConfig,
         description="Optional OPA filter evaluated before council review",
+    )
+    guardrails: GuardrailsConfig = Field(
+        default_factory=GuardrailsConfig,
+        description="Optional per-council prose screen after OPA and before council review",
     )
     telemetry: TelemetryConfig = Field(
         default_factory=TelemetryConfig,

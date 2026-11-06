@@ -258,6 +258,30 @@ opa:
   timeout_ms: "${COUNCIL_OPA_TIMEOUT_MS:-500}"
   fail_closed: "${COUNCIL_OPA_FAIL_CLOSED:-true}"
 
+# ── Guardrails Prose Screen ────────────────────────────────
+# Optional NeMo Guardrails screening of the intent's agent-authored prose
+# channels (description, justification, context, ...). Runs after OPA and
+# before any council LLM sees the intent. The command and packaged files are
+# never screened here — they are judged by OPA, code review, and the members.
+#
+# What the bundled default-council profile actually covers: CODE injection
+# (YARA rules for code, sqli, template and xss) and context bloat. It does NOT
+# cover LLM prompt injection — the rails for that (self check input, jailbreak
+# detection) need a model, and the shipped profile declares none. Prose such as
+# "ignore all previous instructions" passes this screen. Treat it as a
+# code-injection and size filter, not a prompt-injection defence.
+#
+# Ships disabled; enable independently per council once its sidecar is ready.
+# mode: enforce denies on a blocked verdict; shadow records it and proceeds.
+
+guardrails:
+  enabled: "${COUNCIL_GUARDRAILS_ENABLED:-false}"
+  url: "${COUNCIL_GUARDRAILS_URL:-http://guardrails:8000}"
+  config_id: "${COUNCIL_GUARDRAILS_CONFIG_ID:-default-council}"
+  timeout_ms: "${COUNCIL_GUARDRAILS_TIMEOUT_MS:-2000}"
+  fail_closed: "${COUNCIL_GUARDRAILS_FAIL_CLOSED:-true}"
+  mode: "${COUNCIL_GUARDRAILS_MODE:-enforce}"
+
 # ── Internal Monitor Telemetry ─────────────────────────────
 # Side-channel latency telemetry for dashboard-only observability. This is not
 # included in MCP tool responses and is not returned to calling agents.

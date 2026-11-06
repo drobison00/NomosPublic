@@ -76,6 +76,9 @@ build_image deploy/Dockerfile.monitor nomos/monitor
 build_image deploy/Dockerfile.executor nomos/executor
 build_image deploy/Dockerfile.openshell nomos/openshell
 build_image deploy/Dockerfile.agent-signup nomos/agent-signup
+if [[ "${NOMOS_BUILD_GUARDRAILS:-false}" == "true" ]]; then
+  build_image deploy/guardrails/Dockerfile nomos/guardrails
+fi
 
 for img in "${INFRA_IMAGES[@]}"; do
   load_infra_image "$img"

@@ -291,6 +291,7 @@ class CouncilCatalogStore:
             "default": council_id == catalog.default_council_id,
             "enabled": settings.enabled,
             "opa_policy_id": settings.opa.policy_id,
+            "guardrails": settings.guardrails.model_dump(),
             "members": [member.model_dump() for member in settings.members],
             "chairman": settings.chairman.model_dump(),
             "code_review": settings.code_review.model_dump(),
