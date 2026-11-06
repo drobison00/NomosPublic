@@ -21,11 +21,11 @@ Program scope, eligibility, rewards and recognition are governed by the current 
 
 ## Scope and support
 
-The implementation description below was reviewed on **2026-11-05** against public **`drobison00/NomosPublic`** `develop` commit **`5ab4fc89f37de21f1489f5d42840bc32e9409f7f`**. It describes that source snapshot and the bundled examples, not a certification or a guarantee about another revision or a deployed installation. Recheck the active code, configuration and deployment when applying it.
+The implementation description below was reviewed on **2026-11-05** against Nomos `develop` commit **`5ab4fc89f37de21f1489f5d42840bc32e9409f7f`**. It describes that source snapshot and the bundled examples, not a certification or a guarantee about another revision or a deployed installation. Recheck the active code, configuration and deployment when applying it.
 
 The existing repository policy does not publish a supported-version matrix or a security maintenance schedule. This document does not establish one. The [README](README.md) documents Linux deployment support and says native macOS deployment is not currently supported; this is an operating-system statement, not a security-update promise. [CONTRIBUTING.md](CONTRIBUTING.md) currently says the project is not accepting contributions. The review checklist below is for maintainers and authorized reviewers and does not change that policy.
 
-At this snapshot in `drobison00/NomosPublic`, public PRs #1 (command admission), #2 (sensitive-path normalization), #3 (ledger/pending-read authorization), and #4 (ledger integrity) are **open and unmerged**. Their proposed behavior is not part of this baseline. Revisit this dated description when those changes merge or deployment behavior changes. The checklist states what reviewers must establish for affected changes; an unchecked item must not be read as an existing guarantee.
+At this snapshot, proposed fixes for command admission, sensitive-path normalization, ledger/pending-read authorization, and ledger integrity are **unmerged**. Their proposed behavior is not part of this baseline. Revisit this dated description when those changes merge or deployment behavior changes. The checklist states what reviewers must establish for affected changes; an unchecked item must not be read as an existing guarantee.
 
 ## Assets, principals and trust boundaries
 
