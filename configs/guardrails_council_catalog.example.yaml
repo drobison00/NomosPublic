@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Explicit per-council values override the referenced single-council template.
+# Provision and validate council-a/council-b sidecar profiles before enabling.
+default_council_id: council-a
+nat:
+  host: "127.0.0.1"
+  port: 9901
+  transport: streamable-http
+  server_name: Nomos Council
+councils:
+  council-a:
+    config_file: council.yaml
+    council_id: council-a
+    guardrails:
+      enabled: true
+      url: http://guardrails-a:8000
+      config_id: council-a
+      mode: enforce
+      fail_closed: true
+      channels: [description, justification, context, blast_radius, evidence, preceding_commands, rollback_steps]
+      timeout_ms: 2000
+      max_input_bytes: 262144
+      max_response_bytes: 1048576
+      max_in_flight: 4
+  council-b:
+    config_file: council.yaml
+    council_id: council-b
+    guardrails:
+      enabled: false
+      url: http://guardrails-b:8000
+      config_id: council-b
+      mode: enforce
+      fail_closed: true
+      # To observe B independently, set enabled: true and mode: shadow.

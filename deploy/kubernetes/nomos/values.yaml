@@ -61,6 +61,11 @@ images:
     tag: 1.17.0
     digest: ""
     pullPolicy: IfNotPresent
+  guardrails:
+    repository: nomos/guardrails
+    tag: kind
+    digest: ""
+    pullPolicy: ""
   gateway:
     repository: nginxinc/nginx-unprivileged
     tag: 1.27-alpine
@@ -446,6 +451,38 @@ opa:
       cpu: 250m
       memory: 256Mi
 
+# NeMo Guardrails prose-screen sidecar. Disabled by default; the council also
+# gates it per council via council.guardrails.enabled and its own config.
+# V1 rails are local and model-free (no GPU, no API keys).
+guardrails:
+  enabled: false
+  replicas: 1
+  configId: default-council
+  topologySpreadConstraints:
+    enabled: true
+    maxSkew: 1
+    whenUnsatisfiable: ScheduleAnyway
+  service:
+    port: 8000
+  podSecurityContext:
+    runAsNonRoot: true
+    # OpenShift may assign the allowed volume group. On plain Kubernetes set
+    # fsGroup: 10001 (or another allowed writable group) when enabling this pod.
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+    seccompProfile:
+      type: RuntimeDefault
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
 councilGateway:
   # Stateless nginx reverse proxy: token-gates the public /mcp endpoint and
   # load-balances per request across the council pods (council MCP is stateless,
@@ -513,6 +550,15 @@ council:
     gitWorkflowPolicyId: git-workflow-local
     timeoutMs: "500"
     failClosed: "true"
+  guardrails:
+    enabled: false
+    # Empty selects the internal Service URL; may name an external sidecar
+    # even when guardrails.enabled (service provisioning) remains false.
+    url: ""
+    configId: default-council
+    timeoutMs: "2000"
+    failClosed: "true"
+    mode: enforce
   telemetry:
     enabled: true
     timeoutMs: "250"
