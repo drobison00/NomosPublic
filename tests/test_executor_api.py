@@ -323,3 +323,44 @@ def test_executor_does_not_certify_agent_binding_failure():
     assert data["success"] is False
     assert data["verification_stage"] == "agent_binding"
     assert data.get("evidence") is None
+
+
+class _StageEnforcer:
+    """Enforcer stand-in that verified the writ and stopped at ``stage``."""
+
+    def __init__(self, stage: str, success: bool = False):
+        self.stage = stage
+        self.success = success
+
+    async def execute_writ(
+        self,
+        serialized_writ: str,
+        context: ExecutionContext | None = None,
+    ) -> ExecutionResult:
+        return ExecutionResult(
+            writ_id="writ-1",
+            success=self.success,
+            error=None if self.success else f"stopped at {self.stage}",
+            verification_stage=self.stage,
+        )
+
+
+@pytest.mark.parametrize("stage", ["tool_whitelist", "nonce", "temporal", "execution", "timeout"])
+def test_executor_certifies_results_after_writ_verification(stage):
+    # A refusal or failed run of a council-signed writ is still a signed record
+    # of what this executor did with it; integrations (NeMo Relay) cite it.
+    server, thread, loop = _serve_with_identity(_StageEnforcer(stage))
+    try:
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+        data = _post_json(
+            f"{base_url}{EXECUTE_ENDPOINT}",
+            {"writ": _writ_blob(target_agent_id="agent-1"), "request_id": "req-5"},
+            {"X-Agent-ID": "agent-1"},
+        )
+    finally:
+        _stop(server, thread, loop)
+
+    evidence = ExecutionEvidence.model_validate(data["evidence"])
+    assert evidence.verify()
+    assert evidence.payload.result.verification_stage == stage
+    assert evidence.payload.result.success is False
