@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """Client and input shaping for OPA-backed intent filtering."""
 
@@ -185,6 +177,9 @@ def build_intent_filter_input(
             "target_namespace": intent.target_namespace,
             "target_container": intent.target_container,
             "context": intent.context,
+            "operation": intent.operation.model_dump(mode="json")
+            if intent.operation is not None
+            else None,
             "justification": intent.justification,
             "blast_radius": intent.blast_radius,
             "evidence_count": len(intent.evidence),

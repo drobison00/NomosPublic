@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 {{- if .Values.executorOpenshell.enabled }}
 {{- $pvcMode := eq (include "nomos.storageMode" .) "pvc" }}
 apiVersion: v1
@@ -105,7 +97,7 @@ spec:
             - name: EXECUTOR_PUBLIC_KEY_EXPORT_PATH
               value: /app/executor-keys/executor.pub
             {{- else if .Values.executorOpenshell.signer.renderEnv }}
-            {{- /* Service mode (Proposal 07) — signer env per app-contract-v1,
+            {{- /* Service mode — signer env per app-contract-v1,
             gated until executor main consumes vault config. Workspace and
             object-storage env are deliberately NOT rendered this phase (app
             side deferred); workspace itself is a per-pod emptyDir below. */}}

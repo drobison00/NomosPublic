@@ -1,24 +1,52 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """Shared helpers for Nomos council test scripts."""
 
 import json
 import os
 import textwrap
+from urllib.parse import urlsplit
 
 MCP_URL = os.environ.get(
     "NOMOS_MCP_URL",
     os.environ.get("NOMOS_COUNCIL_URL", "http://localhost:9901/mcp"),
 )
+
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _endpoint(url: str) -> tuple[str, str, int | None]:
+    """(scheme, host, port) of a URL, with loopback aliases folded together."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if host in _LOOPBACK_HOSTS:
+        host = "loopback"
+    port = parts.port or {"http": 80, "https": 443}.get(parts.scheme.lower())
+    return parts.scheme.lower(), host, port
+
+
+def proxy_headers(url: str | None = None) -> dict[str, str]:
+    """Bearer header for the monitor's /mcp proxy, when one is configured.
+
+    The deploy scripts generate MONITOR_MCP_PROXY_TOKEN and the monitor rejects
+    unauthenticated requests once it is set, so a live probe that never sends the
+    header cannot reach its own deployment -- it fails with 401 before any product
+    behaviour is exercised. Empty when unset, which keeps an unauthenticated dev
+    proxy working unchanged. deploy/.env carries the token; run_test_suite.py and
+    `uv run --env-file deploy/.env` both load it.
+
+    The header is sent only when ``url`` targets the configured monitor endpoint
+    (MCP_URL: NOMOS_MCP_URL / NOMOS_COUNCIL_URL / localhost:9901). A URL supplied
+    some other way -- test_council.py --url, a typo -- gets no credential, so the
+    token cannot be handed to an unintended host.
+    """
+    token = os.environ.get("MONITOR_MCP_PROXY_TOKEN", "").strip()
+    target = MCP_URL if url is None else url
+    if not token or _endpoint(target) != _endpoint(MCP_URL):
+        return {}
+    return {"Authorization": f"Bearer {token}"}
 
 
 def runtime_agent_id(default_agent_id: str) -> str:

@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 import pytest
 
@@ -145,7 +137,11 @@ async def test_opa_deny_blocks_authorize_before_writ_minting(tmp_path):
     assert result.writ is None
     assert result.decision_id.startswith("intent-")
     assert "production changes require" in result.error
-    assert result.guidance == ["Add maintenance-window evidence."]
+    assert result.retryable is False
+    assert "retryable" not in result.model_dump(mode="json")
+    assert "require fresh authorization" in result.guidance[0]
+    assert result.guidance[1:] == ["Add maintenance-window evidence."]
+    assert result.model_dump(mode="json")["guidance"] == result.guidance
     assert service.council.get_workflow(result.decision_id) is None
     assert opa.calls[0]["request"]["type"] == "authorize"
 

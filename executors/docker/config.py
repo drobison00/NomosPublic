@@ -1,21 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """
 Executor configuration.
 
 Minimal config for the writ executor service. No dependency on nomos.
 All security policy (blocked patterns, denied paths, allowed tools, denied
-tool args) is driven entirely by the YAML config file — there are no
-hardcoded defaults.
+tool args) comes from the YAML config file, except in the unsafe
+environment-only mode, which reads only EXECUTOR_ALLOWED_DIRS and
+EXECUTOR_BLOCKED_PATTERNS. There are no hardcoded policy defaults.
 """
 
 import logging
@@ -52,7 +45,7 @@ class ExecutorConfig:
     executor_private_key_path: str = ""
     executor_public_key_path: str = ""
 
-    # Security — all driven by YAML config, no hardcoded defaults
+    # Security — from YAML, or env-only ALLOWED_DIRS/BLOCKED_PATTERNS; no hardcoded rules
     allowed_working_directories: list[str] = field(default_factory=lambda: ["/workspace"])
     max_command_timeout: int = 60  # seconds — tight default
     blocked_patterns: list[re.Pattern] = field(default_factory=list)
@@ -75,8 +68,9 @@ class ExecutorConfig:
     def from_env(cls) -> "ExecutorConfig":
         """Load config from environment variables (legacy / fallback).
 
-        WARNING: env-only mode has NO security policy — no blocked patterns,
-        no denied paths, no tool whitelist. Use YAML config for production.
+        WARNING: env-only mode applies only EXECUTOR_ALLOWED_DIRS and the
+        regexes in EXECUTOR_BLOCKED_PATTERNS — no denied paths, no tool
+        whitelist, no argument checks. Use YAML config for production.
         """
         allowed_dirs_str = os.environ.get("EXECUTOR_ALLOWED_DIRS", "")
         if allowed_dirs_str:
@@ -258,8 +252,8 @@ class ExecutorConfig:
     def load(cls) -> "ExecutorConfig":
         """Load config: YAML if EXECUTOR_CONFIG is set, else env vars.
 
-        Env-only mode (no EXECUTOR_CONFIG) has no security policy — no blocked
-        patterns, no tool whitelist, no denied paths. To prevent silent
+        Env-only mode (no EXECUTOR_CONFIG) applies only EXECUTOR_ALLOWED_DIRS and
+        EXECUTOR_BLOCKED_PATTERNS — no tool whitelist, no denied paths. To prevent silent
         misconfiguration, env-only mode requires an explicit opt-in via
         EXECUTOR_UNSAFE_NO_POLICY=1. Without it the executor refuses to start.
         """

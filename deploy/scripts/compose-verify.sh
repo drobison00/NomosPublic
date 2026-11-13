@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Verify a running Nomos docker-compose dev stack: service health, council MCP,
 # gateway token-gate, monitor/signup health, Postgres durable state, and a full
@@ -20,6 +13,20 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./dev-lib.sh
 . "$SCRIPT_DIR/dev-lib.sh"
+
+# This script verifies the SERVICE topology, whose postgres, vault and
+# council-gateway services are defined only in docker-compose.service.yml. dc()
+# selects overlays from the environment (mirroring scripts/deploy_stack.sh), so
+# declare the overlay here exactly as compose-up.sh/compose-down.sh do. Without
+# it a standalone re-run (compose-up.sh exports COMPOSE_EXTRA_FILES only to the
+# verify it spawns) gets "no such service: postgres" from `dc ps` and fails the
+# service-mode checks on a correctly deployed stack.
+# Prepend rather than overwrite, so an explicit COMPOSE_EXTRA_FILES still applies.
+SERVICE_OVERLAY="$ROOT_DIR/deploy/docker-compose.service.yml"
+if [[ ":${COMPOSE_EXTRA_FILES:-}:" != *":$SERVICE_OVERLAY:"* ]]; then
+  COMPOSE_EXTRA_FILES="${COMPOSE_EXTRA_FILES:+$COMPOSE_EXTRA_FILES:}$SERVICE_OVERLAY"
+fi
+export COMPOSE_EXTRA_FILES
 
 AGENT_ID="${AGENT_ID:-${NOMOS_AGENT_ID:-$(env_get NOMOS_AGENT_ID)}}"
 AGENT_ID="${AGENT_ID:-dev-agent}"
@@ -36,19 +43,34 @@ check() { local label="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$label"; 
 
 _svc_healthy() {
   local cid state
-  cid="$(dc ps -q "$1" 2>/dev/null | head -n1)"; [ -n "$cid" ] || return 1
+  cid="$(dc ps -q "$1" 2>/dev/null | head -n1)"; [[ -n "$cid" ]] || return 1
   state="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || echo none)"
-  [ "$state" = healthy ] || [ "$state" = running ]
+  [[ "$state" = healthy || "$state" = running ]]
 }
 _code() { curl -sk -o /dev/null -m 8 -w '%{http_code}' "$@"; }
 # Gateway/monitor checks as functions so `check` runs them in-process (a `bash -c`
 # subshell would not see _code or the script globals).
-_gw_healthz()  { [ "$(_code http://localhost:${GATEWAY_PORT}/healthz)" = 200 ]; }
-_gw_noauth()   { [ "$(_code -X POST http://localhost:${GATEWAY_PORT}/mcp)" = 401 ]; }
-_gw_auth()     { local c; c="$(_code -X POST -H "Authorization: Bearer ${PROXY_TOKEN}" http://localhost:${GATEWAY_PORT}/mcp)"; [ "$c" != 401 ] && [ "$c" != 000 ]; }
-_monitor_up()  { [ "$(_code http://localhost:${MONITOR_PORT}/)" != 000 ]; }
+_gw_healthz()  { [[ "$(_code "http://localhost:${GATEWAY_PORT}/healthz")" = 200 ]]; }
+_gw_noauth()   { [[ "$(_code -X POST "http://localhost:${GATEWAY_PORT}/mcp")" = 401 ]]; }
+_gw_auth()     { local c; c="$(_code -X POST -H "Authorization: Bearer ${PROXY_TOKEN}" "http://localhost:${GATEWAY_PORT}/mcp")"; [[ "$c" != 401 && "$c" != 000 ]]; }
+_monitor_up()  { [[ "$(_code "http://localhost:${MONITOR_PORT}/")" != 000 ]]; }
 
 log "Verifying Nomos compose stack (project: $COMPOSE_PROJECT)"
+
+# Every check below assumes the service topology compose-up.sh deploys. The
+# default `DEPLOY_TARGET=compose scripts/deploy_stack.sh` deploy is the redis
+# topology: no postgres, vault or council-gateway, so those checks fail and the
+# in-container flow dies resolving council-gateway with nothing naming the cause.
+# Detect by container label so this does not depend on overlays or deploy/.env
+# (the service overlay cannot even be interpolated without POSTGRES_PASSWORD).
+# -a: a stopped postgres still identifies the topology; the health check below
+# then reports it as unhealthy instead of this guard misreporting the topology.
+if [[ -z "$(docker ps -aq --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
+                           --filter "label=com.docker.compose.service=postgres")" ]]; then
+  die "compose-verify.sh requires the service topology (postgres + vault + council-gateway)," \
+    "but project '$COMPOSE_PROJECT' has no postgres container. Run deploy/scripts/compose-up.sh first;" \
+    "scripts/deploy_stack.sh deploys the redis topology, which this script does not verify."
+fi
 
 # ── service health ───────────────────────────────────────────────────────
 log "Service health"
@@ -59,7 +81,7 @@ for s in redis redis-1 redis-2 redis-sentinel-1 redis-sentinel-2 redis-sentinel-
   check "service $s healthy" _svc_healthy "$s"
 done
 if _svc_healthy agent-signup; then pass "service agent-signup healthy"
-else warn "service agent-signup NOT healthy — build its image from feat/onboarding-console (service-mode console); non-fatal"; fi
+else warn "service agent-signup NOT healthy (service-mode console); non-fatal"; fi
 
 # ── council MCP + gateway token-gate ─────────────────────────────────────
 log "Council MCP + gateway"
@@ -69,9 +91,9 @@ check "gateway /healthz = 200"          _gw_healthz
 check "gateway /mcp no-bearer = 401"    _gw_noauth
 check "gateway /mcp with-bearer != 401" _gw_auth
 check "monitor reachable"               _monitor_up
-if [ "$(_code https://localhost:${SIGNUP_PORT}/healthz 2>/dev/null)" = 200 ]; then
+if [[ "$(_code "https://localhost:${SIGNUP_PORT}/healthz" 2>/dev/null)" = 200 ]]; then
   pass "agent-signup /healthz = 200"
-else warn "agent-signup /healthz != 200 (see onboarding-console note); non-fatal"; fi
+else warn "agent-signup /healthz != 200; non-fatal"; fi
 
 # ── durable state ─────────────────────────────────────────────────────────
 log "Postgres durable state"
@@ -82,18 +104,20 @@ async def m():
     s=PostgresStore(os.environ['COUNCIL_DATABASE_URL']); await s.connect()
     n=len(await s.list_account_ids()); await s.close(); print(n)
 asyncio.run(m())" 2>/dev/null | tail -n1 || echo 0)
-if [ "${acct_ok:-0}" -ge 1 ]; then pass "Postgres has >=1 registered account ($acct_ok)"; else fail "Postgres has no accounts (registration?)"; fi
+if [[ "${acct_ok:-0}" -ge 1 ]]; then pass "Postgres has >=1 registered account ($acct_ok)"; else fail "Postgres has no accounts (registration?)"; fi
 
 # ── functional: authorize -> writ -> execute -> evidence ──────────────────
 log "Functional flow (authorize -> writ -> execute -> signed evidence)"
-if [ -z "$AGENT_TOKEN" ]; then
+if [[ -z "$AGENT_TOKEN" ]]; then
   fail "no AGENT_TOKEN available — cannot run the functional flow"
 else
   # Driven from INSIDE the council container, addressing peers over the docker
   # network: the gateway at council-gateway:8080 and the executor at its container
   # listen port executor-openshell:9906 (the host publishes 9907 -> 9906). Kind's
   # equivalent hits the executor Service at 9907 instead — see kind-verify.sh.
-  cat > /tmp/nomos_compose_e2e.py <<'PY'
+  e2e_file="$(mktemp /tmp/nomos_compose_e2e.XXXXXX.py)"
+  trap 'rm -f "$e2e_file"' EXIT
+  cat > "$e2e_file" <<'PY'
 import asyncio, json, os, sys, httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -122,20 +146,23 @@ async def main():
             print("EXECUTE_OK exit=%s stdout=%r evidence=yes" % (ej.get("exit_code"), (ej.get("stdout") or "").strip()))
 asyncio.run(main())
 PY
+  # docker cp preserves the source mode. The council runs as a non-root user,
+  # so a caller's restrictive umask must not make this script unreadable there.
+  chmod 0644 "$e2e_file"
   POD="$(dc ps -q council | head -n1)"
-  docker cp /tmp/nomos_compose_e2e.py "$POD":/tmp/nomos_compose_e2e.py >/dev/null 2>&1
+  docker cp "$e2e_file" "$POD":/tmp/nomos_compose_e2e.py >/dev/null 2>&1
   if out="$(dc exec -T -e AGENT_ID="$AGENT_ID" council python /tmp/nomos_compose_e2e.py "$AGENT_TOKEN" "$PROXY_TOKEN" 2>&1)"; then
     echo "$out" | grep -q "AUTHORIZE_OK" && pass "authorize approved + writ minted ($(echo "$out" | grep AUTHORIZE_OK))"
     echo "$out" | grep -q "EXECUTE_OK"   && pass "executed + signed evidence ($(echo "$out" | grep EXECUTE_OK))" || fail "execute/evidence failed: $(echo "$out" | tail -n1)"
   else
     fail "functional flow failed: $(echo "$out" | tail -n2 | tr '\n' ' ')"
   fi
-  rm -f /tmp/nomos_compose_e2e.py
+  rm "$e2e_file"
 fi
 
 # ── verdict ───────────────────────────────────────────────────────────────
 echo
-if [ "$FAIL" -eq 0 ]; then
+if [[ "$FAIL" -eq 0 ]]; then
   log "${C_G}VERIFY PASSED${C_0} — $PASS checks OK"
 else
   die "VERIFY FAILED — $FAIL failed, $PASS passed"

@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """HTTP adapter for the trusted executor contract.
 
@@ -57,12 +49,6 @@ from .enforcer import WritEnforcer
 logger = logging.getLogger(__name__)
 
 MAX_REQUEST_SIZE = 1_048_576  # 1MB
-
-
-def _validate_agent_binding(writ_blob: str, caller_agent_id: str) -> dict | None:
-    """Compatibility wrapper for older tests/imports."""
-    result = _contract_validate_agent_binding(writ_blob, caller_agent_id)
-    return result.model_dump() if result else None
 
 
 class ExecutorHandler(BaseHTTPRequestHandler):

@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 {{/*
 Expand chart name.
 */}}
@@ -165,4 +157,14 @@ secretKeyRef:
     - protocol: TCP
       port: {{ .Values.redis.sentinel.service.port }}
 {{- end }}
+{{- end -}}
+
+{{/*
+Effective monitor stats source. The gateway takes /mcp away from the monitor's
+proxy, which leaves the inline registry blind, so an unset value means "redis"
+whenever the gateway is enabled. Used by the monitor env and the NetworkPolicy
+rules that let the monitor reach redis; they must agree.
+*/}}
+{{- define "nomos.monitorStatsSource" -}}
+{{- .Values.monitor.statsSource | default (ternary "redis" "" .Values.councilGateway.enabled) -}}
 {{- end -}}

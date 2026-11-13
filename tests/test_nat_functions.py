@@ -1,18 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """
 Tests for NAT council functions and CouncilService.
 """
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -1163,6 +1156,53 @@ class TestCouncilServiceWithAgents:
     """Tests for CouncilService with mock LLM agents."""
 
     @pytest.mark.asyncio
+    async def test_structured_tool_authorization_reviews_args_and_mints_typed_writ(self):
+        from nomos.auth.writ_factory import WritFactory
+        from nomos.crypto.signer_provider import InMemorySigner
+        from nomos.level_0.crypto.signing import KeyPair
+        from nomos.level_0.types import ToolCallWrit
+
+        service = _make_service_with_mock_agents(["approve"])
+        service._signer_provider = InMemorySigner(KeyPair.generate(key_id="test-council"))
+        recording_backend = RecordingLLMBackend()
+        service._agents[0]._backend = recording_backend
+
+        result = await service.authorize(
+            AuthorizeInput(
+                council_id=service.council_id,
+                agent_id="app-service",
+                description="Send a requested Slack message",
+                justification="The user requested this external write",
+                tool_call={
+                    "schema_version": 1,
+                    "tool_name": "slack.send_message",
+                    "arguments": {
+                        "channel": "C123",
+                        "message": "review this exact text",
+                    },
+                    "subject": "opaque-user-7d9a",
+                },
+            )
+        )
+
+        assert result.status == "approved"
+        writ = WritFactory.deserialize_writ(result.writ or "")
+        assert isinstance(writ, ToolCallWrit)
+        assert writ.verify(service._signer_provider.public_key_bytes())
+        assert writ.payload().operation.tool_name == "slack.send_message"
+        from nomos.level_0.types.tool_call import canonical_tool_arguments
+
+        expected_arguments = canonical_tool_arguments(
+            {"channel": "C123", "message": "review this exact text"}
+        )
+        assert (
+            writ.payload().operation.arguments_sha256
+            == hashlib.sha256(expected_arguments).hexdigest()
+        )
+        prompt = recording_backend.calls[0][1].content
+        assert '"arguments":{"channel":"C123","message":"review this exact text"}' in prompt
+
+    @pytest.mark.asyncio
     async def test_unanimous_approve(self):
         service = _make_service_with_mock_agents(["approve", "approve"])
         result = await service.propose_intent(
@@ -2207,7 +2247,29 @@ class TestAllAgree:
 
 class TestAuthorizeIntegration:
     @pytest.mark.asyncio
-    async def test_headless_allow_follows_council_state(self, tmp_path):
+    async def test_council_denial_invites_independently_reviewed_safer_revision(self):
+        service = _make_service_with_mock_agents(["deny", "deny", "approve"])
+        result = await service.authorize(
+            AuthorizeInput(
+                agent_id="agent-1",
+                command="/bin/cat /run/secrets/application-api-key",
+                working_directory="/tmp",
+                description="Check whether an application credential is configured",
+                target_resource="/run/secrets/application-api-key",
+                justification="Check application configuration",
+            )
+        )
+
+        payload = result.model_dump(mode="json")
+        assert payload["status"] == "denied"
+        assert payload["writ"] is None
+        assert "retryable" not in payload
+        assert "require fresh authorization" in payload["guidance"][0]
+        assert len(payload["council_members"]) == 3
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("policy_decision", ["allow", "deny"])
+    async def test_headless_policy_decisions_omit_retry_hint(self, tmp_path, policy_decision):
         from nomos.level_1.policy import DecisionType, PolicyRule
 
         settings = CouncilSettings(
@@ -2222,11 +2284,11 @@ class TestAuthorizeIntegration:
         service = CouncilService(settings)
         service.council._policy_engine.add_rule(
             PolicyRule(
-                rule_id="allow-system-exec",
-                name="Allow system.exec",
+                rule_id="test-system-exec",
+                name="Test system.exec decision",
                 priority=0,
                 action_types={"system.exec"},
-                decision=DecisionType.ALLOW,
+                decision=DecisionType(policy_decision),
             )
         )
 
@@ -2244,9 +2306,16 @@ class TestAuthorizeIntegration:
 
         workflow = service.council.get_workflow(result.decision_id)
         assert workflow is not None
-        assert workflow.state == WorkflowState.APPROVED
-        assert result.status == "approved"
-        assert result.writ is not None
+        if policy_decision == "allow":
+            assert workflow.state == WorkflowState.APPROVED
+            assert result.status == "approved"
+            assert result.writ is not None
+        else:
+            assert workflow.state == WorkflowState.DENIED
+            assert result.status == "denied"
+            assert result.writ is None
+            assert "require fresh authorization" in result.guidance[0]
+        assert "retryable" not in result.model_dump(mode="json")
 
 
 class TestOverloadShedding:
@@ -2278,6 +2347,11 @@ class TestOverloadShedding:
         assert result.retryable is True
         assert "council_overloaded" in result.error
         assert result.guidance
+        assert result.model_dump(mode="json")["retryable"] is True
+        assert "Authorization is temporarily unavailable" in result.guidance[0]
+        assert "retry the same authorization request" in result.guidance[0]
+        assert "Wait approximately" in result.guidance[0]
+        assert all("require fresh authorization" not in g for g in result.guidance)
 
     @pytest.mark.asyncio
     async def test_propose_sheds_load_when_limiter_saturated(self):
@@ -2384,3 +2458,194 @@ class TestLedgerOffLoop:
         lines = [line for line in ledger_file.read_text().splitlines() if line.strip()]
         assert lines
         assert json.loads(lines[0])["entry_type"]
+
+
+class TestAuthorizeConcurrencyPeak:
+    """How many calls a single authorize has in flight AT ONCE.
+
+    This exists because a config comment once asserted the peak was five, by
+    counting roles: three members, the chairman, and code review. Roles are not
+    concurrency. `_run_code_review` is awaited before the chairman and member
+    tasks are created, so it never overlaps them, and the real peak is four.
+
+    That mattered: the shared endpoint semaphore was raised to 8 on the strength
+    of the wrong number, which would have let two authorize fan-outs reach the
+    provider simultaneously -- more 429s, and no more provider quota. So this
+    measures rather than counts.
+    """
+
+    class _ConcurrencyProbe:
+        """Shared counter recording peak simultaneous completions."""
+
+        def __init__(self):
+            self.live = 0
+            self.peak = 0
+            self.order: list[str] = []
+
+    class _ProbedBackend(LLMBackend):
+        def __init__(self, probe, label: str, payload: str):
+            self._probe = probe
+            self._label = label
+            self._payload = payload
+
+        def provider_name(self):
+            return "probe"
+
+        async def complete(self, messages, temperature=0.0, max_tokens=1024, response_format=None):
+            self._probe.live += 1
+            self._probe.peak = max(self._probe.peak, self._probe.live)
+            self._probe.order.append(f"{self._label}:enter")
+            try:
+                # Yield twice so genuinely-parallel callers overlap here. Without
+                # an await the coroutines would run to completion one at a time
+                # and the measured peak would be 1 no matter what the code does.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                return LLMResponse(content=self._payload, model="probe")
+            finally:
+                self._probe.order.append(f"{self._label}:exit")
+                self._probe.live -= 1
+
+    @staticmethod
+    def _member_payload() -> str:
+        return json.dumps(
+            {"decision": "approve", "reasoning": "fine", "risk_concerns": [], "conditions": []}
+        )
+
+    @pytest.mark.asyncio
+    async def test_peak_is_chairman_plus_members_not_every_role(self):
+        probe = self._ConcurrencyProbe()
+        service = _make_service_with_mock_agents([])
+
+        members = ["command-integrity", "environment-isolation", "blast-containment"]
+        for name in members:
+            backend = self._ProbedBackend(probe, name, self._member_payload())
+            config = CouncilMemberConfig(id=name, backend="probe", weight=1, display_name=name)
+            service._agents.append(CouncilMemberAgent(member_config=config, backend=backend))
+            from nomos.level_0.types import CouncilMember
+
+            service.council.register_council_member(
+                CouncilMember(member_id=name, public_key_hex="", display_name=name, weight=1)
+            )
+
+        chairman_payload = json.dumps(
+            {"threshold": "unanimous", "reasoning": "ok", "risk_level": "low"}
+        )
+        service._chairman = ChairmanAgent(self._ProbedBackend(probe, "chairman", chairman_payload))
+
+        await service.authorize(
+            AuthorizeInput(
+                auth_token="token",
+                agent_id="agent-1",
+                command="/bin/ls -la /workspace",
+                working_directory="/workspace",
+                justification="Measuring the parallel fan-out",
+                description="List the workspace",
+                target_resource="/workspace",
+            )
+        )
+
+        assert probe.peak > 1, (
+            "nothing ran in parallel, so this measured nothing -- the probe must "
+            "await inside complete() for concurrent callers to overlap"
+        )
+        assert probe.peak == 1 + len(members), (
+            f"peak simultaneous calls was {probe.peak}; expected the chairman plus "
+            f"{len(members)} members = {1 + len(members)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_code_review_never_overlaps_the_parallel_phase(self):
+        """Code review is awaited BEFORE the fan-out, so it is not part of the peak.
+
+        This is the specific claim the endpoint cap depends on. Asserted by
+        interval, not by reading the source: code review must have exited before
+        the first member or chairman enters.
+        """
+        probe = self._ConcurrencyProbe()
+        service = _make_service_with_mock_agents([])
+
+        members = ["command-integrity", "environment-isolation", "blast-containment"]
+        for name in members:
+            backend = self._ProbedBackend(probe, name, self._member_payload())
+            config = CouncilMemberConfig(id=name, backend="probe", weight=1, display_name=name)
+            service._agents.append(CouncilMemberAgent(member_config=config, backend=backend))
+            from nomos.level_0.types import CouncilMember
+
+            service.council.register_council_member(
+                CouncilMember(member_id=name, public_key_hex="", display_name=name, weight=1)
+            )
+
+        service._chairman = ChairmanAgent(
+            self._ProbedBackend(
+                probe,
+                "chairman",
+                json.dumps({"threshold": "unanimous", "reasoning": "ok", "risk_level": "low"}),
+            )
+        )
+        review_payload = json.dumps(
+            {
+                "decision": "approve",
+                "reviewed_all_content": True,
+                "claim_match": "match",
+                "overall_risk": "low",
+                "reasoning": "fine",
+                "files": [
+                    {
+                        "path": "run.sh",
+                        # Must match the packaged file the intent actually
+                        # carries: the parser cross-checks digest and mode, and
+                        # a mismatch sends code review down the failure path,
+                        # which is not what this test means to exercise.
+                        "sha256": hashlib.sha256(b"echo hello\n").hexdigest(),
+                        "mode": "0600",
+                        "review_status": "reviewed",
+                        "matches_claimed_behavior": "yes",
+                        "observed_operations": ["echo"],
+                        "risk_findings": [],
+                        "evidence": ["line 1"],
+                    }
+                ],
+                "risk_concerns": [],
+                "conditions": [],
+                "guidance": "",
+            }
+        )
+        service._code_reviewer = CodeReviewAgent(
+            self._ProbedBackend(probe, "code-review", review_payload)
+        )
+
+        await service.authorize(
+            AuthorizeInput(
+                auth_token="token",
+                agent_id="agent-1",
+                command="/bin/sh run.sh",
+                working_directory="/workspace",
+                justification="Measuring whether code review joins the fan-out",
+                description="Run the packaged script",
+                target_resource="/workspace",
+                packaged_files=[
+                    {
+                        "path": "run.sh",
+                        "content_base64": base64.b64encode(b"echo hello\n").decode(),
+                    }
+                ],
+            )
+        )
+
+        order = probe.order
+        assert "code-review:enter" in order, (
+            "code review never ran, so this test proves nothing about its overlap"
+        )
+        review_exit = order.index("code-review:exit")
+        first_parallel = min(
+            order.index(f"{name}:enter")
+            for name in [*members, "chairman"]
+            if f"{name}:enter" in order
+        )
+        assert review_exit < first_parallel, (
+            f"code review had not finished when the fan-out began: {order}"
+        )
+        assert probe.peak == 1 + len(members), (
+            f"peak was {probe.peak}; code review must not raise it above {1 + len(members)}"
+        )

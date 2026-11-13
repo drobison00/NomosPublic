@@ -26,19 +26,14 @@ Wired via the MCP front-end ``runner_class`` in the NAT workflow config:
 """
 
 from mcp.server.fastmcp import FastMCP
-
-try:
-    # nvidia-nat-mcp >= 1.5 ships the MCP front end here.
-    from nat.plugins.mcp.server.front_end_plugin_worker import MCPFrontEndPluginWorker
-except ImportError:  # pragma: no cover - newer NAT relocated the MCP front end
-    from nat.front_ends.mcp.mcp_front_end_plugin_worker import MCPFrontEndPluginWorker
+from nat.plugins.mcp.server.front_end_plugin_worker import MCPFrontEndPluginWorker
 
 
 class StatelessMCPWorker(MCPFrontEndPluginWorker):
     """Default NAT MCP worker, but serving streamable-HTTP statelessly."""
 
     async def create_mcp_server(self) -> FastMCP:
-        mcp = await super().create_mcp_server()
+        mcp: FastMCP = await super().create_mcp_server()
         # Read by FastMCP.streamable_http_app() when the transport is built
         # (after create_mcp_server + add_routes), so mutating it here takes
         # effect. json_response is left False so responses stay SSE and the

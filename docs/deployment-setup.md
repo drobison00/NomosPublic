@@ -1,13 +1,6 @@
 <!--
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-
-NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-property and proprietary rights in and to this material, related
-documentation and any modifications thereto. Any use, reproduction,
-disclosure or distribution of this material and related documentation
-without an express license agreement from NVIDIA CORPORATION or
-its affiliates is strictly prohibited.
+SPDX-License-Identifier: Apache-2.0
 -->
 
 # Nomos Deployment Setup Crash Course
@@ -21,6 +14,26 @@ The main entrypoint is:
 ```bash
 NVIDIA_API_KEY=nvapi-... ./scripts/deploy_stack.sh
 ```
+
+Generate `NVIDIA_API_KEY` by opening the [Build/API page](https://build.nvidia.com/)
+for any configured model and choosing **Generate API Key**. These NVIDIA API
+Catalog NIM inference endpoints are intended for evaluation and trial use. For
+production deployments, use a self-hosted NVIDIA NIM endpoint or configure
+another production-suitable inference backend, such as the documented
+direct-provider alternatives. Review the
+[NVIDIA API Trial Terms](https://assets.ngc.nvidia.com/products/api-catalog/legal/NVIDIA%20API%20Trial%20Terms%20of%20Service.pdf)
+before relying on the hosted API Catalog endpoints.
+
+The default council config and the commented mixed-model example require
+only `NVIDIA_API_KEY`. To use the commented
+direct-vendor alternatives, replace the active `llm_backends`, update every
+`members[].backend`, `chairman.backend`, and `code_review.backend` reference,
+and set the matching provider key. For the local Compose/Kind bootstrappers,
+set `ALLOW_MISSING_NVIDIA_API_KEY=1` only if no active backend uses NVIDIA. See
+[Anthropic authentication](https://platform.claude.com/docs/en/manage-claude/authentication)
+and the [OpenAI quickstart](https://developers.openai.com/api/docs/quickstart).
+For a self-hosted NIM or compatible model server, follow
+[Deploy Nomos with Self-Hosted Models](self-hosted-models.md).
 
 `DEPLOY_TARGET` defaults to `kind`. That path requires Docker, Kind, kubectl,
 and Helm. If you only want Docker Compose, make the target explicit:
@@ -76,8 +89,12 @@ uv run ./scripts/run_test_suite.py \
 ```
 
 Then run the low-risk live council MCP tests with the generated
-`NOMOS_AGENT_ID` and `NOMOS_AUTH_TOKEN`. The full checklist is in
-[Council MCP Validation](council-mcp-validation.md).
+`NOMOS_AGENT_ID`, `NOMOS_AUTH_TOKEN`, and `MONITOR_MCP_PROXY_TOKEN`. These are
+two separate layers. The transport layer
+is the monitor's Bearer token: send `MONITOR_MCP_PROXY_TOKEN` as
+`Authorization: Bearer <token>` on `/mcp`, and without it every call is refused
+with `401` before any council behaviour runs. Above that, each tool supplies the credentials its own schema defines in `params.arguments`: `council_authorize` and `council_propose_intent` require both `agent_id` and `auth_token`; `council_check_writ_status` takes `auth_token` only; status and public-key reads take neither; and council-management tools use `management_token`. All three are written to `deploy/.env`. The
+full checklist is in [Council MCP Validation](council-mcp-validation.md).
 
 ## Mental Model
 
@@ -198,18 +215,27 @@ in `deploy/.env`.
 - Creates the Kind cluster when missing, unless `KIND_CREATE_CLUSTER=0`.
 - Builds and loads local images, unless `SKIP_BUILD=1`.
 - Installs the Helm chart with `deploy/kubernetes/kind-values.yaml`.
+- Disables the chart's Ingress objects unless the cluster already has the `nginx`
+  `IngressClass`, an `ingress-ready=true` node *and* host ports 80/443 mapped on
+  the control-plane node — all of which come from
+  `deploy/kubernetes/scripts/kind-up.sh` and `kind-cluster.yaml`. A cluster this
+  script created cannot gain the host port mappings later, so installing
+  ingress-nginx on it (for example by running `kind-up.sh` against it) does not
+  make the hostnames reachable; recreate it with `kind-up.sh` for hostname ingress.
 - Creates or syncs the `nomos-secrets` Secret, unless
   `KIND_USE_EXISTING_SECRET_ONLY=1`.
 - Creates the default agent account, unless `SKIP_ACCOUNT=1`.
 - Starts local port-forwards, unless `KIND_PORT_FORWARD=0`.
 
-Kind uses `deploy/kubernetes/kind-values.yaml`, where `demo.enabled=true`.
-The `WITH_DEMO` flag controls Compose demo startup. For Kind, demo exposure is
-mainly controlled by Helm values and `KIND_PORT_FORWARD_DEMO`.
+Kind uses `deploy/kubernetes/kind-values.yaml`, which does not set `demo`, so the
+chart default `demo.enabled=false` applies. **The demo UI is a Compose-only
+service:** the chart carries `demo.*` values, Secret keys and NetworkPolicies but
+no demo Deployment or Service, so setting `demo.enabled=true` renders no
+workload. Use `WITH_DEMO=1` with `DEPLOY_TARGET=compose` for the demo.
 
 ### Kind With Pre-Created Secret
 
-Use this path for customer test clusters where secrets are already published to
+Use this path for clusters where secrets are already published to
 Kubernetes and no local `deploy/.env` should be written:
 
 ```bash
@@ -246,16 +272,13 @@ uv run ./scripts/run_test_suite.py \
 Compose-only deep validation:
 
 ```bash
-set -a
-. deploy/.env
-set +a
-
-uv run python scripts/test_smoke.py
-uv run python scripts/test_live_e2e.py
+uv run --env-file deploy/.env python scripts/test_smoke.py
+uv run --env-file deploy/.env python scripts/test_live_e2e.py
 ```
 
 The Compose-only scripts expect host Redis access and a Docker executor
-container name. For Kind, keep to the portable MCP and gRPC tests unless you add
+container name. The environment file must come from the same Compose deployment
+being tested. For Kind, keep to the portable MCP and gRPC tests unless you add
 matching port-forwards and container lookup logic.
 
 ## Deployment Control Flags
@@ -323,7 +346,7 @@ based on the selected flags.
 | `KIND_PORT_FORWARD_MONITOR` | `1` | Shell | Forward monitor/MCP. |
 | `KIND_PORT_FORWARD_GRPC` | `1` | Shell | Forward council gRPC proxy. |
 | `KIND_PORT_FORWARD_AGENT_SIGNUP` | `1` | Shell | Forward signup UI/API. |
-| `KIND_PORT_FORWARD_DEMO` | `1` | Shell | Forward demo UI. |
+| `KIND_PORT_FORWARD_DEMO` | `$WITH_DEMO` (so `0`) | Shell | Forward demo UI. |
 | `KIND_PORT_FORWARD_EXECUTOR` | `1` | Shell | Forward executor. |
 | `KIND_FORWARD_MONITOR_PORT` | `MONITOR_PORT` or `9901` | Shell or `deploy/.env` via `current_or_default` | Local forwarded monitor port. |
 | `KIND_FORWARD_GRPC_PORT` | `COUNCIL_GRPC_PORT` or `9904` | Shell or `deploy/.env` via `current_or_default` | Local forwarded gRPC port. |
@@ -338,13 +361,14 @@ based on the selected flags.
 
 | Variable | Generated? | Used By | Effect |
 |---|---:|---|---|
-| `NVIDIA_API_KEY` | No | Council | Required by the shipped `configs/council.yaml`. |
-| `ANTHROPIC_API_KEY` | No | Council | Optional backend key if profiles use Anthropic. |
-| `OPENAI_API_KEY` | No | Council | Optional backend key if profiles use OpenAI. |
+| `NVIDIA_API_KEY` | No | Council | Required by the NVIDIA API Catalog NIM inference endpoints. |
+| `ANTHROPIC_API_KEY` | No | Council | Used only after activating the matching commented Anthropic backends. |
+| `OPENAI_API_KEY` | No | Council | Used only after activating the matching commented OpenAI backend. |
 | `REDIS_PASSWORD` | Yes | Redis, council, signup, executors | Redis auth password. |
 | `COUNCIL_REDIS_ACCOUNT_INTEGRITY_KEY` | Yes | Council, signup, account CLI | HMAC key for account-critical Redis state. |
 | `COUNCIL_MANAGEMENT_TOKEN` | Yes | Council | Required for mutating dynamic-council MCP tools. |
 | `MONITOR_INTERNAL_TOKEN` | Yes | Council, monitor | Internal telemetry auth from council to monitor. |
+| `MONITOR_MCP_PROXY_TOKEN` | Yes | Monitor, gRPC proxy, demo, every MCP client | Bearer token the monitor enforces on `/mcp`. Without it every MCP call is refused with `401`. |
 | `MONITOR_DASHBOARD_USER` | Defaults `admin` | Monitor | Browser dashboard basic-auth user. |
 | `MONITOR_DASHBOARD_PASSWORD` | Yes | Monitor | Browser dashboard basic-auth password. |
 | `NOMOS_SIGNUP_ADMIN_USER` | Defaults `admin` | Signup | Signup admin user. |
@@ -363,7 +387,7 @@ Optional values commonly added to `deploy/.env`:
 
 | Variable | Default | Used By | Effect |
 |---|---:|---|---|
-| `COUNCIL_CONFIG_FILE` | `../configs/council.yaml` | Compose council mount | Alternate static council config file. Use absolute paths when unsure. |
+| `COUNCIL_CONFIG_FILE` | `../configs/council.yaml` | Compose council mount | Alternate static mount; does not replace the live dynamic profile. See [changing the council model configuration](#changing-the-council-model-configuration). |
 | `COMPOSE_REDIS_TOPOLOGY` | `sentinel` | Deploy script | Select Compose Redis topology. |
 | `REDIS_SENTINEL_SERVICE_NAME` | `nomos-master` | Compose Sentinel | Sentinel master name. |
 | `COUNCIL_OPA_URL` | `http://opa:8181` | Council | External/custom OPA URL. |
@@ -476,6 +500,11 @@ Compose service: `monitor`
 - Publishes `${MONITOR_PORT:-9901}:9901`.
 - Proxies external MCP `/mcp` traffic to `council:9901`.
 - Serves dashboard at `/`.
+- Reads `MONITOR_MCP_PROXY_TOKEN` and enforces it as `Authorization: Bearer` on
+  `/mcp`. Every MCP client — the gRPC proxy, the demo, and your own agents —
+  must send it, or the request is refused with `401` before the council is
+  reached. `/debug/tools/list` is deliberately unauthenticated, so it does not
+  exercise this token.
 - Reads `MONITOR_DASHBOARD_USER` and `MONITOR_DASHBOARD_PASSWORD`.
 - Reads `MONITOR_INTERNAL_TOKEN` for internal telemetry.
 - Reads `MONITOR_LEDGER_PATHS` for dashboard ledger visibility.
@@ -485,7 +514,8 @@ Compose service: `monitor`
 Compose service: `council-grpc`
 
 - Publishes `${COUNCIL_GRPC_BIND_ADDR:-0.0.0.0}:${COUNCIL_GRPC_PORT:-9904}:9904`.
-- Uses `COUNCIL_MCP_URL=http://monitor:9901/mcp`.
+- Uses `COUNCIL_MCP_URL=http://monitor:9901/mcp` and
+  `COUNCIL_MCP_PROXY_TOKEN=${MONITOR_MCP_PROXY_TOKEN}`.
 - Tags traffic through monitor so gRPC appears in unified stats.
 
 ### Agent Signup
@@ -587,11 +617,11 @@ Important secret keys:
 | Account integrity key | `COUNCIL_REDIS_ACCOUNT_INTEGRITY_KEY` |
 | Council management token | `COUNCIL_MANAGEMENT_TOKEN` |
 | Monitor internal token | `MONITOR_INTERNAL_TOKEN` |
+| Monitor MCP proxy token | `MONITOR_MCP_PROXY_TOKEN` |
 | Monitor dashboard user | `MONITOR_DASHBOARD_USER` |
 | Monitor dashboard password | `MONITOR_DASHBOARD_PASSWORD` |
 | Signup admin user | `NOMOS_SIGNUP_ADMIN_USER` |
 | Signup admin password | `NOMOS_SIGNUP_ADMIN_PASSWORD` |
-| Demo Basic auth user | `DEMO_AUTH_USER` |
 | Demo Basic auth password | `DEMO_AUTH_PASSWORD` |
 | Demo token | `NOMOS_AUTH_TOKEN` |
 | Demo agent ID | `NOMOS_AGENT_ID` |
@@ -646,7 +676,7 @@ Pods receive:
 | `opa.enabled` | `true` | Render bundled OPA. |
 | `opa.logLevel` | `info` | OPA log level. |
 | `opa.service.port` | `8181` | OPA service port. |
-| `opa.resources` | `{}` | OPA resources. |
+| `opa.resources` | requests 25m / 64Mi, limits 250m / 256Mi | OPA resources. |
 
 Council OPA values:
 
@@ -673,7 +703,7 @@ Council OPA values:
 | `council.persistence.publicKeys.*` | enabled, `64Mi` | Public key PVC shared with executor. |
 | `council.persistence.ledger.*` | enabled, `1Gi` | Ledger PVC. |
 | `council.persistence.dynamicConfig.*` | enabled, `256Mi` | Dynamic council config PVC. |
-| `council.resources` | `{}` | Resource requests/limits. |
+| `council.resources` | requests 100m / 256Mi, limits 1 / 1Gi | Resource requests/limits. |
 
 ### Monitor, gRPC, Signup, Demo
 
@@ -689,8 +719,8 @@ Council OPA values:
 | `agentSignup.allowedCouncils` | `council-prod` | Signup allowed councils. |
 | `agentSignup.defaultRole` | `developer` | Signup default role. |
 | `agentSignup.allowedRoles` | `readonly,developer` | Signup allowed roles. |
-| `demo.enabled` | `false` in chart, `true` in Kind values | Render demo UI. |
-| `demo.service.port` | `8000` | Demo service port. |
+| `demo.enabled` | `false` | Gates the demo NetworkPolicies only. The chart ships no demo Deployment or Service, so this renders no workload — the demo UI is Compose-only. |
+| `demo.service.port` | `8000` | Demo port referenced by the NetworkPolicies. |
 | `demo.auth.user/password` | empty | Direct demo HTTP Basic auth values; otherwise Secret refs are used. |
 | `demo.auth token fields` | empty | Direct demo agent token values; otherwise Secret refs are used. |
 
@@ -763,6 +793,46 @@ Those placeholders are resolved by `CouncilSettings` and `RedisConfig` inside
 the container. In Sentinel mode, validation requires both a master name and
 sentinel nodes.
 
+### Changing the Council Model Configuration
+
+For a step-by-step self-hosted endpoint setup, see
+[Deploy Nomos with Self-Hosted Models](self-hosted-models.md).
+
+`configs/council.yaml` and the Helm-packaged copy at
+`deploy/kubernetes/nomos/files/council/council.yaml` are release templates, kept
+identical by `test_shipped_council_templates_match`. Editing a template does not
+change a council that is already running: the first bootstrap copies the
+template to a live location and later runs leave that copy alone, so operator
+edits survive a redeploy.
+
+| Deployment | Live council profile |
+|---|---|
+| Compose | `deploy/dynamic-config/council.yaml` on the host |
+| Helm `storage.mode=pvc` | `/app/dynamic-config/council.yaml` on the `-dynamic-config` claim |
+| Helm `storage.mode=service` (the Kind default) | `/bootstrap-config`, mounted read-only from the packaged ConfigMap |
+
+In Compose, edit the host file, put any new provider key in `deploy/.env`, then
+recreate the `council` service, which reads provider keys from its environment
+only at startup. In Helm PVC mode, edit the profile in the council pod; the
+runtime reloads changed catalog and profile files on the next request. In
+service mode the catalog is read-only. Supply a complete profile with
+`--set-file council.configOverride=/absolute/path.yaml` on `helm upgrade`, or
+update the packaged files under `deploy/kubernetes/nomos/files/council/`.
+The chart rolls out the council when its ConfigMap profile changes. The Kind
+bootstrappers accept `KIND_COUNCIL_PROFILE_FILE` and pass it to Helm; the
+[self-hosted launcher](self-hosted-models.md) generates that file for you.
+
+Copy the live profile before editing it so you can restore it.
+`COUNCIL_CONFIG_FILE` is a separate static mount at `/app/configs/council.yaml`;
+it does not replace the live dynamic profile. When running management commands
+from a checkout, pass `--catalog` pointing at a writable copy of the catalog
+and its profiles so the command does not edit the release templates.
+
+After a model change, run the
+[endpoint compatibility and deployed MCP checks](council-mcp-validation.md)
+against the intended council and confirm which model it actually requested. A
+passing health check does not prove routing.
+
 ## Account Creation Flow
 
 By default, `deploy_stack.sh` creates or verifies one agent account.
@@ -782,7 +852,9 @@ Kind path:
 3. Runs `scripts/agent_accounts.py`.
 4. Stores `NOMOS_AGENT_ID` and `NOMOS_AUTH_TOKEN` in `deploy/.env`.
 5. Patches the Kubernetes Secret with the token.
-6. Restarts the demo deployment so it picks up the token.
+6. Attempts a `rollout restart` of `<release>-demo` so it would pick up the
+   token. The chart renders no demo Deployment, so this is a tolerated no-op on
+   a stock Kind deploy.
 
 Skip with:
 
@@ -816,12 +888,12 @@ Compose publishes these by default when the relevant service is enabled:
 | Endpoint | Default URL | Gate |
 |---|---|---|
 | Monitor UI | `http://$NOMOS_PUBLIC_HOST:9901/` | Always in Compose deploy. |
-| MCP | `http://$NOMOS_PUBLIC_HOST:9901/mcp` | Always in Compose deploy. |
+| MCP | `http://$NOMOS_PUBLIC_HOST:9901/mcp` | Always in Compose deploy. Requires `Authorization: Bearer $MONITOR_MCP_PROXY_TOKEN`. |
 | gRPC | `$NOMOS_PUBLIC_HOST:9904` | Always in Compose deploy. |
-| Agent signup | `http://$NOMOS_PUBLIC_HOST:9905/` | `WITH_AGENT_SIGNUP=1` default. |
-| Agent admin | `http://$NOMOS_PUBLIC_HOST:9905/admin` | `WITH_AGENT_SIGNUP=1` default. |
+| Agent signup | `https://$NOMOS_PUBLIC_HOST:9905/` | `WITH_AGENT_SIGNUP=1` default. |
+| Agent admin | `https://$NOMOS_PUBLIC_HOST:9905/admin` | `WITH_AGENT_SIGNUP=1` default. |
 | OpenShell executor | `http://$NOMOS_PUBLIC_HOST:9907` | `EXECUTOR_PROFILE=executor-openshell`. |
-| Demo UI | `http://$NOMOS_PUBLIC_HOST:8000` | `WITH_DEMO=1`. |
+| Demo UI | `https://$NOMOS_PUBLIC_HOST:8000` | `WITH_DEMO=1`. |
 | Redis | `$NOMOS_PUBLIC_HOST:6379` | Always published by base Compose. |
 | OPA | `http://$NOMOS_PUBLIC_HOST:8181` | `WITH_OPA=1` default. |
 
@@ -832,7 +904,7 @@ Kind uses local port-forwards instead of host-published ports:
 | Monitor/MCP | `http://127.0.0.1:9901` | `KIND_PORT_FORWARD_MONITOR=1`. |
 | Council gRPC | `127.0.0.1:9904` | `KIND_PORT_FORWARD_GRPC=1`. |
 | Signup | `https://127.0.0.1:9905` | `KIND_PORT_FORWARD_AGENT_SIGNUP=1`. |
-| Demo | `https://127.0.0.1:8000` | `KIND_PORT_FORWARD_DEMO=1` and `demo.enabled=true`. |
+| Demo | n/a | The chart has no demo workload to forward to; the demo is Compose-only. |
 | Executor | `http://127.0.0.1:9907` | `KIND_PORT_FORWARD_EXECUTOR=1`. |
 
 ## Persistent State
@@ -930,13 +1002,13 @@ DEPLOY_TARGET=compose WITH_DEMO=1 ./scripts/deploy_stack.sh
 Then look for:
 
 ```text
-Demo UI: http://<host>:8000
+Demo UI: https://<host>:8000
 ```
 
 Kind:
 
-- `demo.enabled` must be true in Helm values.
-- `KIND_PORT_FORWARD_DEMO=1` must be enabled for local access.
+- Not available. The chart ships no demo Deployment or Service, so there is
+  nothing to enable or port-forward. Use the Compose path above.
 
 ### Sentinel validation fails with missing `sentinel_nodes`
 

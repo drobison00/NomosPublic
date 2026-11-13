@@ -1,13 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-//
-// NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-// property and proprietary rights in and to this material, related
-// documentation and any modifications thereto. Any use, reproduction,
-// disclosure or distribution of this material and related documentation
-// without an express license agreement from NVIDIA CORPORATION or
-// its affiliates is strictly prohibited.
-
+// SPDX-License-Identifier: Apache-2.0
 
 /* Council Monitor — dashboard driver.
  *
@@ -19,6 +11,9 @@
  */
 
 const POLL_MS = 1000;
+const HEALTH_POLL_MS = 5000; // each /healthz call probes the council
+// A request that never settles must not hold the poll loop: it is aborted after this.
+const FETCH_TIMEOUT_MS = 10000;
 const HISTORY_POINTS = 300; // 5 minutes at 1s cadence
 const LEDGER_PAGE_SIZE = 100;
 const COUNCIL_TOOLS = new Set([
@@ -50,6 +45,8 @@ const history = {
   actorLatency: {},
 };
 let lastInflight = null;
+let polling = false;
+let lastHealthPoll = 0;
 let windowSeconds = 60;
 let latestRows = [];
 let latestLedger = { chains: [], entries: [], summary: {} };
@@ -74,6 +71,7 @@ const els = {
   healthValue: $("health-value"),
   sampleValue: $("sample-value"),
   inflight: $("stat-inflight"),
+  inflightSub: $("stat-inflight-sub"),
   inflightCard: document.querySelector('[data-stat="inflight"]'),
   completed: $("stat-completed"),
   completedSub: $("stat-completed-sub"),
@@ -167,6 +165,7 @@ function wireTabs() {
         panel.classList.toggle("active", active);
       }
       drawCharts();
+      if (target === "requests") pollRecent();
       if (target === "ledger" && ledgerEntries.length === 0 && !ledgerLoading) {
         resetAndLoadLedger();
       }
@@ -262,26 +261,27 @@ async function loadConfig() {
 }
 
 async function tick() {
+  // Health runs on its own schedule, even while a metrics request is pending.
+  if (Date.now() - lastHealthPoll >= HEALTH_POLL_MS) pollHealth();
+  // Never overlap: a slow poll racing a newer one renders stale numbers last.
+  if (polling) return;
+  polling = true;
   const t0 = performance.now();
   try {
-    const [metrics, recent, health] = await Promise.all([
-      fetchJson("/api/metrics"),
-      fetchJson("/api/recent?limit=50"),
-      fetchJson("/healthz").catch(() => null),
-    ]);
-    renderStats(metrics);
-    renderBreakdowns(metrics);
-    renderAgentActivity(metrics);
-    renderCouncilLatency(metrics);
-    renderDecisionInsights(metrics);
+    const metrics = await fetchJson("/api/metrics");
+    // Each panel renders on its own so one bad field cannot blank the rest.
+    safely("stats", () => renderStats(metrics));
+    safely("scope labels", () => renderScopeLabels(metrics));
+    safely("breakdowns", () => renderBreakdowns(metrics));
+    safely("agent activity", () => renderAgentActivity(metrics));
+    safely("council latency", () => renderCouncilLatency(metrics));
+    safely("decision insights", () => renderDecisionInsights(metrics));
     if (globalThis.nomosPipeline) globalThis.nomosPipeline.update(metrics);
-    renderRecent(recent.rows);
     if (activeTab === "ledger" && ledgerEntries.length === 0 && !ledgerLoading) {
       resetAndLoadLedger();
     }
-    pushHistory(metrics);
-    drawCharts();
-    if (health) renderHealth(health);
+    safely("history", () => pushHistory(metrics));
+    safely("charts", drawCharts);
     const ms = Math.round(performance.now() - t0);
     els.lastPollPill.textContent = `last poll: ${ms}ms`;
     els.sampleValue.textContent = metrics.asof_ms
@@ -294,11 +294,43 @@ async function tick() {
     els.lastPollPill.classList.remove("pill-meta", "pill-ok");
     els.lastPollPill.classList.add("pill-bad");
     console.error("poll failed:", err);
+  } finally {
+    polling = false;
+  }
+  // Side channels never gate the metrics render above.
+  if (activeTab === "requests") pollRecent();
+}
+
+function safely(name, fn) {
+  try {
+    fn();
+  } catch (err) {
+    console.error(`${name} render failed:`, err);
+  }
+}
+
+async function pollRecent() {
+  try {
+    renderRecent((await fetchJson("/api/recent?limit=50")).rows);
+  } catch (err) {
+    console.error("recent poll failed:", err);
+  }
+}
+
+async function pollHealth() {
+  lastHealthPoll = Date.now();
+  try {
+    // /healthz answers 503 with a JSON body when the council is down; that
+    // body is exactly what the upstream pill needs, so don't treat it as a failure.
+    const r = await fetch("/healthz");
+    renderHealth(await r.json());
+  } catch (err) {
+    renderHealth({ upstream: { ok: false, error: "monitor unreachable" } });
   }
 }
 
 async function fetchJson(url) {
-  const r = await fetch(url);
+  const r = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
   if (!r.ok) throw new Error(`${url} → ${r.status}`);
   return r.json();
 }
@@ -314,8 +346,14 @@ function renderStats(m) {
       400,
     );
   }
-  els.inflight.textContent = inflight;
-  els.inflightCard.classList.toggle("active", inflight > 0);
+  // The Redis stream only carries finished requests, so inflight is unknowable there.
+  const inflightKnown = m.stats_source !== "redis";
+  els.inflight.textContent = inflightKnown ? inflight : "n/a";
+  els.inflight.classList.toggle("na", !inflightKnown);
+  els.inflightSub.textContent = inflightKnown
+    ? "requests in progress"
+    : "not reported by council telemetry";
+  els.inflightCard.classList.toggle("active", inflightKnown && inflight > 0);
   lastInflight = inflight;
 
   const completed = m.completed_in_window ?? 0;
@@ -339,7 +377,7 @@ function renderStats(m) {
     ? "—"
     : `${(successRate * 100).toFixed(1)}%`;
   els.successSub.textContent = completed > 0
-    ? `${completed - (m.error_count ?? 0)} ok / ${completed}`
+    ? `${completed - (m.error_count ?? 0)} served / ${completed} · denials count as served`
     : "no samples";
   els.successCard.classList.remove("warn", "bad");
   if (successRate != null && successRate < 0.95) els.successCard.classList.add("bad");
@@ -368,6 +406,18 @@ function applyLatencyTone(stat, ms) {
   else if (ms >= 1500) card.classList.add("warn");
 }
 
+function renderScopeLabels(m) {
+  // "Totals" are process-lifetime counters inline, but a bounded replay in Redis mode.
+  const text = m.stats_source === "redis"
+    ? `last ${m.completed_total ?? 0} council records (Redis stream)`
+    : "since monitor start";
+  for (const el of document.querySelectorAll(".scope-total")) el.textContent = text;
+}
+
+function unavailableText(m, fallback) {
+  return m.stats_source === "redis" ? "not carried by council telemetry" : fallback;
+}
+
 function renderBreakdowns(m) {
   renderBars(els.bySource, m.by_source_total || m.by_source || {}, "source");
   renderBars(els.byTool, m.by_tool_total || m.by_tool || {}, "tool");
@@ -385,7 +435,7 @@ function renderAgentActivity(m) {
 
   if (!rows.length) {
     els.agentActivityBody.innerHTML =
-      '<tr class="empty"><td colspan="6">waiting for attributed calls</td></tr>';
+      `<tr class="empty"><td colspan="6">${escapeHtml(unavailableText(m, "waiting for attributed calls"))}</td></tr>`;
     els.agentActivitySub.textContent = "calls attributed by agent_id";
     return;
   }
@@ -413,14 +463,16 @@ function renderDecisionInsights(m) {
     m.by_decision_outcome_total || m.by_decision_outcome || {},
     "outcome",
   );
-  renderBars(els.byRisk, m.by_risk_total || m.by_risk || {}, "risk");
-  renderBars(els.byErrorClass, m.by_error_class_total || m.by_error_class || {}, "reason");
+  const empty = unavailableText(m, "no traffic recorded");
+  renderBars(els.byRisk, m.by_risk_total || m.by_risk || {}, "risk", empty);
+  renderBars(els.byErrorClass, m.by_error_class_total || m.by_error_class || {}, "reason", empty);
   renderBars(
     els.byMissingPermission,
     m.by_missing_permission_total || m.by_missing_permission || {},
     "permission",
+    empty,
   );
-  renderBars(els.byCodeReview, m.by_code_review_total || m.by_code_review || {}, "review");
+  renderBars(els.byCodeReview, m.by_code_review_total || m.by_code_review || {}, "review", empty);
 }
 
 function renderCouncilLatency(m) {
@@ -457,9 +509,7 @@ function renderActorLatency(actors) {
   }
   els.actorLatencyBody.innerHTML = rows
     .map((row) => {
-      const actor = row.role === "chairman" || row.role === "code_review"
-        ? row.role
-        : row.member_id || row.role || "unknown";
+      const actor = actorDisplayName(row) || "unknown";
       return `
         <tr>
           <td title="${escapeHtml(row.role || "")}">${escapeHtml(actor)}</td>
@@ -474,11 +524,11 @@ function renderActorLatency(actors) {
     .join("");
 }
 
-function renderBars(container, counts, kind) {
+function renderBars(container, counts, kind, emptyText = "no traffic recorded") {
   const entries = Object.entries(counts).sort(([, a], [, b]) => b - a);
   const total = entries.reduce((sum, [, count]) => sum + count, 0);
   if (entries.length === 0) {
-    container.innerHTML = '<li class="bar-empty">no traffic recorded</li>';
+    container.innerHTML = `<li class="bar-empty">${escapeHtml(emptyText)}</li>`;
     return;
   }
   const max = Math.max(...entries.map(([, v]) => v));
@@ -499,6 +549,61 @@ function renderBars(container, counts, kind) {
     .join("");
 }
 
+function recentStatePresentation(row) {
+  if (row.state === "inflight") return { css: "inflight", label: "inflight" };
+  return { css: `completed ${row.ok ? "ok" : "bad"}`, label: row.ok ? "ok" : "fail" };
+}
+
+function recentToolHtml(row) {
+  if (row.tool) return escapeHtml(row.tool);
+  return `<span class="muted">${escapeHtml(row.method || "-")}</span>`;
+}
+
+function recentDurationTone(durationMs) {
+  if (durationMs >= 5000) return "bad";
+  if (durationMs >= 1500) return "warn";
+  return "";
+}
+
+function recentAgentHtml(agent) {
+  if (!agent) return '<span class="muted">—</span>';
+  return `<span class="agent-chip">${escapeHtml(agent)}</span>`;
+}
+
+function renderRecentRow(row) {
+  const state = recentStatePresentation(row);
+  const tool = recentToolHtml(row);
+  const decision = row.decision || null;
+  const request = row.request || (decision || {}).request || {};
+  const agent = request.agent_id || "";
+  const outcome = decision ? decision.outcome || "unknown" : "";
+  const risk = decision ? decision.risk_level || "" : "";
+  const voteText = decision
+    ? `${decision.approval_votes || 0}/${decision.denial_votes || 0}/${decision.abstain_votes || 0}`
+    : "—";
+  const detailTitle = decisionTitle(decision);
+  const status = formatStatus(row.status_code, row.ok);
+  const duration = row.duration_ms != null ? formatDuration(row.duration_ms) : "…";
+  const age = row.state === "inflight"
+    ? formatAge(row.age_ms || 0)
+    : `${formatAge(row.age_ms || 0)} ago`;
+  const sourceClass = `source-${escape(row.source || "direct")}`;
+  const durationTone = recentDurationTone(row.duration_ms);
+  return `
+    <tr class="${row.state}">
+      <td><span class="state-chip ${state.css}">${state.label}</span></td>
+      <td>${tool}</td>
+      <td><span class="source-chip ${sourceClass}">${escapeHtml(row.source || "direct")}</span></td>
+      <td title="${escapeHtml(agent)}">${recentAgentHtml(agent)}</td>
+      <td>${formatOutcome(outcome, detailTitle)}</td>
+      <td>${formatRisk(risk)}</td>
+      <td class="num" title="approve / deny / abstain">${voteText}</td>
+      <td>${status}</td>
+      <td class="num duration ${durationTone}">${duration}</td>
+      <td class="num">${age}</td>
+    </tr>`;
+}
+
 function renderRecent(rows) {
   latestRows = Array.isArray(rows) ? rows : [];
   const viewRows = filterAndSortRows(latestRows);
@@ -514,50 +619,7 @@ function renderRecent(rows) {
     els.recentSub.textContent = `0 shown from ${latestRows.length} recent`;
     return;
   }
-  els.recentBody.innerHTML = viewRows
-    .map((r) => {
-      const stateClass = r.state === "inflight"
-        ? "inflight"
-        : `completed ${r.ok ? "ok" : "bad"}`;
-      const stateLabel = r.state === "inflight"
-        ? "inflight"
-        : r.ok ? "ok" : "fail";
-      const tool = r.tool
-        ? escapeHtml(r.tool)
-        : `<span class="muted">${escapeHtml(r.method || "-")}</span>`;
-      const decision = r.decision || null;
-      const request = r.request || (decision || {}).request || {};
-      const agent = request.agent_id || "";
-      const outcome = decision ? decision.outcome || "unknown" : "";
-      const risk = decision ? decision.risk_level || "" : "";
-      const voteText = decision
-        ? `${decision.approval_votes || 0}/${decision.denial_votes || 0}/${decision.abstain_votes || 0}`
-        : "—";
-      const detailTitle = decisionTitle(decision);
-      const status = formatStatus(r.status_code, r.ok);
-      const dur = r.duration_ms != null ? formatDuration(r.duration_ms) : "…";
-      const age = r.state === "inflight"
-        ? formatAge(r.age_ms || 0)
-        : `${formatAge(r.age_ms || 0)} ago`;
-      const sourceClass = `source-${escape(r.source || "direct")}`;
-      const durationTone = r.duration_ms >= 5000
-        ? "bad"
-        : r.duration_ms >= 1500 ? "warn" : "";
-      return `
-        <tr class="${r.state}">
-          <td><span class="state-chip ${stateClass}">${stateLabel}</span></td>
-          <td>${tool}</td>
-          <td><span class="source-chip ${sourceClass}">${escapeHtml(r.source || "direct")}</span></td>
-          <td title="${escapeHtml(agent)}">${agent ? `<span class="agent-chip">${escapeHtml(agent)}</span>` : '<span class="muted">—</span>'}</td>
-          <td>${formatOutcome(outcome, detailTitle)}</td>
-          <td>${formatRisk(risk)}</td>
-          <td class="num" title="approve / deny / abstain">${voteText}</td>
-          <td>${status}</td>
-          <td class="num duration ${durationTone}">${dur}</td>
-          <td class="num">${age}</td>
-        </tr>`;
-    })
-    .join("");
+  els.recentBody.innerHTML = viewRows.map(renderRecentRow).join("");
   const inflight = viewRows.filter((r) => r.state === "inflight").length;
   const suffix = viewRows.length === latestRows.length ? "shown" : `shown from ${latestRows.length}`;
   els.recentSub.textContent = `${inflight} inflight, ${viewRows.length - inflight} completed ${suffix}`;
@@ -669,7 +731,7 @@ function renderLedger(snapshot) {
   els.ledgerList.innerHTML = rows.map(renderLedgerRow).join("");
   for (const item of els.ledgerList.querySelectorAll("[data-ledger-key]")) {
     item.addEventListener("click", () => {
-      const nextKey = item.getAttribute("data-ledger-key") || "";
+      const nextKey = item.dataset.ledgerKey || "";
       if (nextKey === selectedLedgerKey) return;
       selectedLedgerKey = nextKey;
       renderLedger(latestLedger);
@@ -827,41 +889,41 @@ function ledgerSearchText(entry) {
   ].filter(Boolean).join(" ").toLowerCase();
 }
 
-function filterAndSortRows(rows) {
-  const query = els.requestFilter.value.trim().toLowerCase();
-  const source = els.sourceFilter.value;
-  const state = els.stateFilter.value;
-  const status = els.statusFilter.value;
-  const outcome = els.outcomeFilter.value;
-  const risk = els.riskFilter.value;
-  const sort = els.requestSort.value;
+function matchesSourceFilter(row, source) {
+  if (source === "all") return true;
+  const rowSource = row.source || "direct";
+  return source === "other" ? !KNOWN_SOURCES.has(rowSource) : rowSource === source;
+}
 
-  const filtered = rows.filter((r) => {
-    if (source !== "all") {
-      const rowSource = r.source || "direct";
-      if (source === "other") {
-        if (KNOWN_SOURCES.has(rowSource)) return false;
-      } else if (rowSource !== source) {
-        return false;
-      }
-    }
-    if (state !== "all") {
-      if (state === "ok") {
-        if (r.ok !== true) return false;
-      } else if (state === "failed") {
-        if (r.ok !== false) return false;
-      } else if (r.state !== state) {
-        return false;
-      }
-    }
-    const rowOutcome = (r.decision || {}).outcome || "none";
-    if (outcome !== "all" && rowOutcome !== outcome) return false;
-    const rowRisk = (r.decision || {}).risk_level || "none";
-    if (risk !== "all" && rowRisk !== risk) return false;
-    if (status !== "all" && statusBucket(r.status_code) !== status) return false;
-    if (query && !rowSearchText(r).includes(query)) return false;
-    return true;
-  });
+function matchesStateFilter(row, state) {
+  if (state === "all") return true;
+  if (state === "ok") return row.ok === true;
+  if (state === "failed") return row.ok === false;
+  return row.state === state;
+}
+
+function matchesRequestFilters(row, filters) {
+  if (!matchesSourceFilter(row, filters.source)) return false;
+  if (!matchesStateFilter(row, filters.state)) return false;
+  const outcome = (row.decision || {}).outcome || "none";
+  if (filters.outcome !== "all" && outcome !== filters.outcome) return false;
+  const risk = (row.decision || {}).risk_level || "none";
+  if (filters.risk !== "all" && risk !== filters.risk) return false;
+  if (filters.status !== "all" && statusBucket(row.status_code) !== filters.status) return false;
+  return !filters.query || rowSearchText(row).includes(filters.query);
+}
+
+function filterAndSortRows(rows) {
+  const filters = {
+    query: els.requestFilter.value.trim().toLowerCase(),
+    source: els.sourceFilter.value,
+    state: els.stateFilter.value,
+    status: els.statusFilter.value,
+    outcome: els.outcomeFilter.value,
+    risk: els.riskFilter.value,
+  };
+  const sort = els.requestSort.value;
+  const filtered = rows.filter((row) => matchesRequestFilters(row, filters));
 
   if (sort === "recent") return filtered;
   return [...filtered].sort((a, b) => compareRows(a, b, sort));
@@ -979,8 +1041,12 @@ function drawCharts() {
     actorSeries,
     { fill: false, yLabel: "p95 latency", valueFormatter: formatAxisDuration, emptyMax: 1000 },
   );
-  els.stageLatencyChartSub.innerHTML = seriesLegend(stageSeries, "rolling p95 by stage");
-  els.actorLatencyChartSub.innerHTML = seriesLegend(actorSeries, "rolling p95 by actor");
+  els.stageLatencyChartSub.innerHTML = seriesLegend(
+    stageSeries, "rolling p95 by stage", Object.keys(history.stageLatency).length,
+  );
+  els.actorLatencyChartSub.innerHTML = seriesLegend(
+    actorSeries, "rolling p95 by actor", Object.keys(history.actorLatency).length,
+  );
 }
 
 function pushLatencyHistory(store, rows, labelField, ts) {
@@ -1001,28 +1067,57 @@ function pruneLatencyHistory(store, now) {
   }
 }
 
+const seriesColorSlots = new WeakMap(); // history store -> Map(label -> palette index)
+
+// The slowest series, at most one per palette colour so no two lines share a
+// colour. A series keeps its colour for as long as it stays on the chart.
 function topLatencySeries(store) {
-  return Object.entries(store)
-    .map(([label, points], index) => ({
+  const shown = Object.entries(store)
+    .map(([label, points]) => ({
       label,
       data: points,
-      color: SERIES_COLORS[index % SERIES_COLORS.length],
       latest: points.length ? points[points.length - 1].value : 0,
     }))
-    .sort((a, b) => b.latest - a.latest);
+    .sort((a, b) => b.latest - a.latest)
+    .slice(0, SERIES_COLORS.length);
+
+  if (!seriesColorSlots.has(store)) seriesColorSlots.set(store, new Map());
+  const slots = seriesColorSlots.get(store);
+  for (const label of [...slots.keys()]) {
+    if (!shown.some((s) => s.label === label)) slots.delete(label);
+  }
+  for (const s of shown) {
+    if (!slots.has(s.label)) {
+      const used = new Set(slots.values());
+      slots.set(s.label, SERIES_COLORS.findIndex((_, i) => !used.has(i)));
+    }
+    s.color = SERIES_COLORS[slots.get(s.label)];
+  }
+  return shown;
 }
 
 function latencySeriesLabel(row, fallbackKey, labelField) {
   if (labelField === "stage") return row.stage || fallbackKey;
-  if (row.role === "chairman" || row.role === "code_review") return row.role;
-  return row.member_id || row.role || fallbackKey;
+  return actorDisplayName(row) || fallbackKey;
 }
 
-function seriesLegend(series, emptyText) {
+function actorDisplayName(row) {
+  if (row.role === "chairman" || row.role === "code_review") return row.role;
+  const debate = /^council_member_debate_(\d+)$/.exec(row.role || "");
+  const name = row.member_id || row.role || "";
+  // Round first: table cells ellipsize the tail, which is where a suffix would be.
+  return debate ? `debate ${debate[1]} · ${name}` : name;
+}
+
+function seriesLegend(series, emptyText, available = series.length) {
   if (!series.length) return escapeHtml(emptyText);
-  return series
+  const items = series
     .map((s) => `<span class="chart-legend-item"><span class="legend-dot" style="background:${s.color}"></span>${escapeHtml(s.label)}</span>`)
     .join("");
+  const hidden = available - series.length;
+  return hidden > 0
+    ? `${items}<span class="chart-legend-item">slowest ${series.length} of ${available}</span>`
+    : items;
 }
 
 function drawSparkline(canvas, series, options = {}) {

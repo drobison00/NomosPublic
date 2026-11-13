@@ -1,14 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 #
 # One-command local deployment for Nomos.
@@ -34,6 +26,7 @@
 #   AGENT_COUNCILS=council-prod     Comma-separated councils to grant
 #   AGENT_DISPLAY_NAME="Alice"      Display name for created account
 #   AGENT_FORCE_ROTATE=1            Rotate token if account already exists
+#   VALIDATION_IDENTITY=1            Use the dedicated readonly validation account
 #   WITH_OPA=0                      Skip the bundled OPA sidecar only when using external OPA
 #   WITH_AGENT_SIGNUP=1             Start local signup UI on AGENT_SIGNUP_PORT, default 9905
 #   WITH_DEMO=1                     Start demo UI on DEMO_PORT, default 8000
@@ -45,7 +38,8 @@
 
 set -Eeuo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEPLOY_STACK_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$DEPLOY_STACK_SCRIPT_DIR/.." && pwd)"
 DEPLOY_TARGET="${DEPLOY_TARGET:-kind}"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/deploy/docker-compose.yml}"
 COMPOSE_REDIS_TOPOLOGY="${COMPOSE_REDIS_TOPOLOGY:-}"
@@ -63,6 +57,14 @@ KIND_BUILD_SCRIPT="${KIND_BUILD_SCRIPT:-$ROOT_DIR/deploy/kubernetes/scripts/buil
 KIND_SECRET_NAME="${KIND_SECRET_NAME:-nomos-secrets}"
 HELM_RELEASE="${HELM_RELEASE:-nomos}"
 KIND_ROLLOUT_RESTART="${KIND_ROLLOUT_RESTART:-1}"
+# Components excluded from the post-deploy rollout restart. These run upstream
+# images (not the locally-built nomos/* tags), so restarting them serves no
+# purpose — and restarting vault actively breaks the deploy by discarding the
+# in-memory bootstrap that enables its Kubernetes auth method.
+KIND_NO_RESTART_COMPONENTS="${KIND_NO_RESTART_COMPONENTS:-vault,opa,redis-sentinel,council-gateway}"
+# Collapse a whitespace-only override to empty. "notin ( )" is not a valid
+# label selector, so the restart sweep would fail rather than skip nothing.
+KIND_NO_RESTART_COMPONENTS="$(printf '%s' "$KIND_NO_RESTART_COMPONENTS" | tr -d '[:space:]')"
 KIND_USE_EXISTING_SECRET_ONLY="${KIND_USE_EXISTING_SECRET_ONLY:-0}"
 KIND_PORT_FORWARD="${KIND_PORT_FORWARD:-1}"
 KIND_PORT_FORWARD_ADDRESS="${KIND_PORT_FORWARD_ADDRESS:-127.0.0.1}"
@@ -71,20 +73,51 @@ KIND_PORT_FORWARD_TIMEOUT_SECONDS="${KIND_PORT_FORWARD_TIMEOUT_SECONDS:-20}"
 KIND_PORT_FORWARD_MONITOR="${KIND_PORT_FORWARD_MONITOR:-1}"
 KIND_PORT_FORWARD_GRPC="${KIND_PORT_FORWARD_GRPC:-1}"
 KIND_PORT_FORWARD_AGENT_SIGNUP="${KIND_PORT_FORWARD_AGENT_SIGNUP:-1}"
-KIND_PORT_FORWARD_DEMO="${KIND_PORT_FORWARD_DEMO:-1}"
 KIND_PORT_FORWARD_EXECUTOR="${KIND_PORT_FORWARD_EXECUTOR:-1}"
 EXECUTOR_PROFILE="${EXECUTOR_PROFILE:-executor-openshell}"
-AGENT_ID="${AGENT_ID:-agent-developer}"
-AGENT_ROLE="${AGENT_ROLE:-developer}"
-AGENT_COUNCILS="${AGENT_COUNCILS:-council-prod}"
-AGENT_DISPLAY_NAME="${AGENT_DISPLAY_NAME:-$AGENT_ID}"
+VALIDATION_IDENTITY="${VALIDATION_IDENTITY:-0}"
+case "$VALIDATION_IDENTITY" in
+  1|true)
+    AGENT_ID="${AGENT_ID:-nomos-validation}"
+    # `developer`, not `readonly`: the documented authenticated E2E paths create
+    # files under /workspace and so need file:write. This identity is dedicated
+    # and freely rotatable, so it can carry that scope without touching the
+    # shared deployment account. Operator/admin infrastructure checks remain
+    # separately opt-in.
+    AGENT_ROLE="${AGENT_ROLE:-developer}"
+    AGENT_COUNCILS="${AGENT_COUNCILS:-council-prod}"
+    AGENT_DISPLAY_NAME="${AGENT_DISPLAY_NAME:-Nomos validation}"
+    AGENT_ID_STORE_KEY=NOMOS_VALIDATION_AGENT_ID
+    AGENT_TOKEN_STORE_KEY=NOMOS_VALIDATION_AUTH_TOKEN
+    ;;
+  *)
+    AGENT_ID="${AGENT_ID:-agent-developer}"
+    AGENT_ROLE="${AGENT_ROLE:-developer}"
+    AGENT_COUNCILS="${AGENT_COUNCILS:-council-prod}"
+    AGENT_DISPLAY_NAME="${AGENT_DISPLAY_NAME:-$AGENT_ID}"
+    AGENT_ID_STORE_KEY=NOMOS_AGENT_ID
+    AGENT_TOKEN_STORE_KEY=NOMOS_AUTH_TOKEN
+    ;;
+esac
 AGENT_FORCE_ROTATE="${AGENT_FORCE_ROTATE:-0}"
+# Exit status agent_accounts.py uses for "the account store could not be reached",
+# as distinct from "the credential is invalid". Keep in sync with
+# EXIT_STORE_UNAVAILABLE in scripts/agent_accounts.py.
+ACCOUNT_STORE_UNAVAILABLE=3
 SKIP_ACCOUNT="${SKIP_ACCOUNT:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 WITH_OPA="${WITH_OPA:-1}"
 WITH_AGENT_SIGNUP="${WITH_AGENT_SIGNUP:-1}"
 WITH_DEMO="${WITH_DEMO:-0}"
+# Forward the demo only when the demo was actually requested. The Kind chart has
+# no demo template at all (it is Compose-only), so defaulting this on made every
+# Kind deploy fail at the port-forward step — "Port-forward for demo exited
+# before listening on 127.0.0.1:8000" — even with all deployments Ready.
+KIND_PORT_FORWARD_DEMO="${KIND_PORT_FORWARD_DEMO:-$WITH_DEMO}"
 WAIT_TIMEOUT_SECONDS="${WAIT_TIMEOUT_SECONDS:-240}"
+
+# shellcheck source=../deploy/scripts/kind-ingress.sh
+. "$ROOT_DIR/deploy/scripts/kind-ingress.sh"
 
 COMPOSE_PROFILES=()
 if [[ -n "$EXECUTOR_PROFILE" ]]; then
@@ -102,6 +135,12 @@ die() {
 
 have_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+require_supported_bash() {
+  if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    die "Bash 4.3 or newer is required; found ${BASH_VERSION}. Install a newer Bash and ensure it appears first on PATH."
+  fi
 }
 
 print_usage() {
@@ -124,6 +163,8 @@ Common environment knobs:
   KIND_CREATE_CLUSTER=1               Create Kind cluster when missing.
   KIND_USE_EXISTING_SECRET_ONLY=1     Use pre-created Kind Secret; do not write deploy/.env.
   KIND_PORT_FORWARD=1                 Start Kind port-forwards.
+  VALIDATION_IDENTITY=1               Provision or reuse a dedicated readonly validation identity.
+  AGENT_FORCE_ROTATE=1                Deliberately rotate the selected identity's token.
   EXECUTOR_PROFILE=executor-openshell Executor profile to deploy.
   WITH_AGENT_SIGNUP=1                 Start the signup UI.
   WITH_DEMO=1                         Start the demo UI.
@@ -159,13 +200,13 @@ compose_file_args() {
 compose() {
   local -a compose_files=()
   compose_file_args compose_files
-  docker compose "${compose_files[@]}" "${COMPOSE_PROFILES[@]}" "$@"
+  docker compose --env-file "$ENV_FILE" "${compose_files[@]}" "${COMPOSE_PROFILES[@]}" "$@"
 }
 
 compose_all_profiles() {
   local -a compose_files=()
   compose_file_args compose_files
-  docker compose "${compose_files[@]}" \
+  docker compose --env-file "$ENV_FILE" "${compose_files[@]}" \
     --profile executor-openshell \
     --profile executor-default \
     --profile executor-dev \
@@ -319,6 +360,7 @@ write_kind_secret_values() {
     write_kind_secret_value councilRedisAccountIntegrityKey COUNCIL_REDIS_ACCOUNT_INTEGRITY_KEY
     write_kind_secret_value councilManagementToken COUNCIL_MANAGEMENT_TOKEN
     write_kind_secret_value monitorInternalToken MONITOR_INTERNAL_TOKEN
+    write_kind_secret_value monitorMcpProxyToken MONITOR_MCP_PROXY_TOKEN
     write_kind_secret_value monitorDashboardUser MONITOR_DASHBOARD_USER admin
     write_kind_secret_value monitorDashboardPassword MONITOR_DASHBOARD_PASSWORD
     write_kind_secret_value signupAdminUser NOMOS_SIGNUP_ADMIN_USER admin
@@ -370,6 +412,7 @@ write_kind_secret_patch() {
     write_kind_secret_patch_value COUNCIL_REDIS_ACCOUNT_INTEGRITY_KEY COUNCIL_REDIS_ACCOUNT_INTEGRITY_KEY
     write_kind_secret_patch_value COUNCIL_MANAGEMENT_TOKEN COUNCIL_MANAGEMENT_TOKEN
     write_kind_secret_patch_value MONITOR_INTERNAL_TOKEN MONITOR_INTERNAL_TOKEN
+    write_kind_secret_patch_value MONITOR_MCP_PROXY_TOKEN MONITOR_MCP_PROXY_TOKEN
     write_kind_secret_patch_value MONITOR_DASHBOARD_USER MONITOR_DASHBOARD_USER admin
     write_kind_secret_patch_value MONITOR_DASHBOARD_PASSWORD MONITOR_DASHBOARD_PASSWORD
     write_kind_secret_patch_value NOMOS_SIGNUP_ADMIN_USER NOMOS_SIGNUP_ADMIN_USER admin
@@ -447,9 +490,18 @@ is_ipv4_literal() {
   [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
 }
 
+validate_env_value() {
+  local key="$1"
+  local value="$2"
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+    die "$key must not contain carriage returns or newlines."
+  fi
+}
+
 set_env_var() {
   local key="$1"
   local value="$2"
+  validate_env_value "$key" "$value"
   mkdir -p "$(dirname "$ENV_FILE")"
   touch "$ENV_FILE"
   chmod 600 "$ENV_FILE"
@@ -457,7 +509,8 @@ set_env_var() {
   local tmp
   tmp="$(mktemp)"
   if grep -q "^${key}=" "$ENV_FILE"; then
-    awk -v key="$key" -v value="$value" 'BEGIN { line = key "=" value } $1 ~ "^" key "=" { print line; next } { print }' "$ENV_FILE" >"$tmp"
+    printf '%s\n' "$value" |
+      awk -v key="$key" 'NR == FNR { value = $0; next } $1 ~ "^" key "=" { print key "=" value; next } { print }' - "$ENV_FILE" >"$tmp"
   else
     cat "$ENV_FILE" >"$tmp"
     printf '%s=%s\n' "$key" "$value" >>"$tmp"
@@ -549,6 +602,9 @@ ensure_kind_prereqs() {
   have_cmd kind || die "Kind is not installed or not on PATH."
   have_cmd kubectl || die "kubectl is not installed or not on PATH."
   have_cmd helm || die "Helm is not installed or not on PATH."
+  if is_true "$KIND_PORT_FORWARD"; then
+    have_cmd timeout || die "GNU timeout is required when Kind port-forwarding is enabled. Install GNU Coreutils or set KIND_PORT_FORWARD=0."
+  fi
   [[ -x "$KIND_BUILD_SCRIPT" ]] || die "Kind image build script is not executable: $KIND_BUILD_SCRIPT"
   [[ -f "$KIND_VALUES_FILE" ]] || die "Kind values file not found: $KIND_VALUES_FILE"
   [[ -f "$KIND_CHART_DIR/Chart.yaml" ]] || die "Helm chart not found: $KIND_CHART_DIR"
@@ -595,6 +651,55 @@ kind_secret_data_present() {
   [[ -n "$value" ]]
 }
 
+kind_secret_value() {
+  local key="$1"
+  local encoded
+  encoded="$(kubectl_kind -n "$KIND_NAMESPACE" get secret "$KIND_SECRET_NAME" -o "jsonpath={.data.$key}" 2>/dev/null || true)"
+  [[ -n "$encoded" ]] || return 0
+  printf '%s' "$encoded" | base64 -d
+}
+
+# Presence is exactly "protected_agent_token resolves a token", so it defers to
+# that single implementation rather than restating the store precedence.
+protected_agent_credentials_present() {
+  protected_agent_token >/dev/null
+}
+
+protected_agent_token() {
+  local stored_agent_id stored_token
+  if [[ "$DEPLOY_TARGET" == "kind" || "$DEPLOY_TARGET" == "kubernetes" ]] && is_true "$KIND_USE_EXISTING_SECRET_ONLY"; then
+    stored_agent_id="$(kind_secret_value "$AGENT_ID_STORE_KEY")"
+    stored_token="$(kind_secret_value "$AGENT_TOKEN_STORE_KEY")"
+  else
+    stored_agent_id="$(current_value "$AGENT_ID_STORE_KEY")"
+    stored_token="$(current_value "$AGENT_TOKEN_STORE_KEY")"
+    if [[ "$stored_agent_id" != "$AGENT_ID" || -z "$stored_token" ]]; then
+      case "$DEPLOY_TARGET" in
+        kind|kubernetes)
+          stored_agent_id="$(kind_secret_value "$AGENT_ID_STORE_KEY")"
+          stored_token="$(kind_secret_value "$AGENT_TOKEN_STORE_KEY")"
+          ;;
+      esac
+    fi
+  fi
+  [[ "$stored_agent_id" == "$AGENT_ID" && -n "$stored_token" ]] || return 1
+  printf '%s' "$stored_token"
+}
+
+missing_or_unusable_agent_credentials() {
+  local store="$ENV_FILE"
+  if [[ "$DEPLOY_TARGET" == "kind" || "$DEPLOY_TARGET" == "kubernetes" ]] && is_true "$KIND_USE_EXISTING_SECRET_ONLY"; then
+    store="Kubernetes Secret $KIND_NAMESPACE/$KIND_SECRET_NAME"
+  elif [[ "$DEPLOY_TARGET" == "kind" || "$DEPLOY_TARGET" == "kubernetes" ]]; then
+    store="$ENV_FILE or Kubernetes Secret $KIND_NAMESPACE/$KIND_SECRET_NAME"
+  fi
+  printf '[deploy] ERROR: Account state: present; protected token missing or unusable for %s.\n' "$AGENT_ID" >&2
+  printf '[deploy] Redis stores only the token hash; the raw token cannot be recovered.\n' >&2
+  printf '[deploy] Choose one: restore %s and %s in %s; provision a separate identity with VALIDATION_IDENTITY=1; or deliberately rotate this identity with AGENT_FORCE_ROTATE=1.\n' \
+    "$AGENT_ID_STORE_KEY" "$AGENT_TOKEN_STORE_KEY" "$store" >&2
+  return 1
+}
+
 patch_kind_secret_literal() {
   local key="$1"
   local value="$2"
@@ -637,6 +742,7 @@ ensure_kind_existing_secret_only() {
     COUNCIL_REDIS_ACCOUNT_INTEGRITY_KEY
     COUNCIL_MANAGEMENT_TOKEN
     MONITOR_INTERNAL_TOKEN
+    MONITOR_MCP_PROXY_TOKEN
     MONITOR_DASHBOARD_USER
     MONITOR_DASHBOARD_PASSWORD
     NOMOS_SIGNUP_ADMIN_USER
@@ -683,6 +789,7 @@ write_kind_secret_values_from_existing_secret() {
     write_kind_secret_value_from_secret councilRedisAccountIntegrityKey COUNCIL_REDIS_ACCOUNT_INTEGRITY_KEY
     write_kind_secret_value_from_secret councilManagementToken COUNCIL_MANAGEMENT_TOKEN
     write_kind_secret_value_from_secret monitorInternalToken MONITOR_INTERNAL_TOKEN
+    write_kind_secret_value_from_secret monitorMcpProxyToken MONITOR_MCP_PROXY_TOKEN
     write_kind_secret_value_from_secret monitorDashboardUser MONITOR_DASHBOARD_USER
     write_kind_secret_value_from_secret monitorDashboardPassword MONITOR_DASHBOARD_PASSWORD
     write_kind_secret_value_from_secret signupAdminUser NOMOS_SIGNUP_ADMIN_USER
@@ -883,6 +990,18 @@ print_kind_urls() {
 }
 
 ensure_env() {
+  if [[ -f "$ENV_FILE" ]]; then
+    chmod 600 "$ENV_FILE"
+  fi
+
+  local key value
+  for key in REDIS_PASSWORD COUNCIL_REDIS_ACCOUNT_INTEGRITY_KEY COUNCIL_MANAGEMENT_TOKEN; do
+    value="${!key:-}"
+    if [[ -n "$value" ]]; then
+      validate_env_value "$key" "$value"
+    fi
+  done
+
   if [[ ! -f "$ENV_FILE" ]]; then
     log "Creating $ENV_FILE"
     cat >"$ENV_FILE" <<'EOF'
@@ -894,6 +1013,7 @@ REDIS_PASSWORD=
 COUNCIL_REDIS_ACCOUNT_INTEGRITY_KEY=
 COUNCIL_MANAGEMENT_TOKEN=
 MONITOR_INTERNAL_TOKEN=
+MONITOR_MCP_PROXY_TOKEN=
 MONITOR_DASHBOARD_USER=admin
 MONITOR_DASHBOARD_PASSWORD=
 NOMOS_SIGNUP_ADMIN_USER=admin
@@ -907,9 +1027,14 @@ NOMOS_DEPLOY_PROFILE=dev
 NOMOS_ALPHA_ALLOW_PUBLIC_BIND=
 EOF
     chmod 600 "$ENV_FILE"
-  else
-    chmod 600 "$ENV_FILE"
   fi
+
+  for key in REDIS_PASSWORD COUNCIL_REDIS_ACCOUNT_INTEGRITY_KEY COUNCIL_MANAGEMENT_TOKEN; do
+    value="${!key:-}"
+    if [[ -n "$value" ]]; then
+      set_env_var "$key" "$value"
+    fi
+  done
 
   local redis_password
   redis_password="$(current_value REDIS_PASSWORD)"
@@ -969,6 +1094,23 @@ EOF
     monitor_internal_token="$(random_secret)"
     set_env_var MONITOR_INTERNAL_TOKEN "$monitor_internal_token"
     log "Generated MONITOR_INTERNAL_TOKEN in deploy/.env"
+  fi
+
+  if [[ -n "${MONITOR_MCP_PROXY_TOKEN:-}" ]]; then
+    set_env_var MONITOR_MCP_PROXY_TOKEN "$MONITOR_MCP_PROXY_TOKEN"
+  fi
+
+  # Without this the chart's committed placeholder (values.yaml
+  # secrets.stringData.monitorMcpProxyToken) becomes the live credential for the
+  # monitor's /mcp proxy -- a token anyone with the repository already knows.
+  # Generating it here also puts it in deploy/.env, which is where README's
+  # end-to-end example tells the reader their credentials live.
+  local monitor_mcp_proxy_token
+  monitor_mcp_proxy_token="$(current_value MONITOR_MCP_PROXY_TOKEN)"
+  if [[ -z "$monitor_mcp_proxy_token" ]]; then
+    monitor_mcp_proxy_token="$(random_secret)"
+    set_env_var MONITOR_MCP_PROXY_TOKEN "$monitor_mcp_proxy_token"
+    log "Generated MONITOR_MCP_PROXY_TOKEN in deploy/.env"
   fi
 
   if [[ -n "${MONITOR_DASHBOARD_USER:-}" ]]; then
@@ -1082,6 +1224,16 @@ EOF
   fi
 }
 
+relax_dynamic_config_permissions() {
+  [[ -d "$DYNAMIC_CONFIG_DIR" ]] || return 0
+  COUNCIL_CONFIG_GID="$(current_or_default COUNCIL_CONFIG_GID "$(id -g)")"
+  [[ "$COUNCIL_CONFIG_GID" =~ ^[0-9]+$ ]] || die "COUNCIL_CONFIG_GID must be a numeric group ID"
+  export COUNCIL_CONFIG_GID
+  "$DEPLOY_STACK_SCRIPT_DIR/../deploy/scripts/prepare-dynamic-config.sh" \
+    "$DYNAMIC_CONFIG_DIR" "$COUNCIL_CONFIG_GID" || return $?
+  set_env_var COUNCIL_CONFIG_GID "$COUNCIL_CONFIG_GID"
+}
+
 ensure_runtime_read_permissions() {
   # Docker preserves host file modes for COPY inputs and bind mounts. Some
   # enterprise checkouts use 0640/0750, but runtime containers switch to
@@ -1108,7 +1260,7 @@ ensure_runtime_read_permissions() {
     chmod -R a+rX "$path"
   done
   [[ -f "$ENV_FILE" ]] && chmod 600 "$ENV_FILE"
-  [[ -d "$DYNAMIC_CONFIG_DIR" ]] && chmod -R a+rwX "$DYNAMIC_CONFIG_DIR"
+  relax_dynamic_config_permissions
 }
 
 ensure_dynamic_council_config() {
@@ -1126,7 +1278,7 @@ ensure_dynamic_council_config() {
     fi
   done
 
-  chmod -R a+rwX "$DYNAMIC_CONFIG_DIR"
+  relax_dynamic_config_permissions
 }
 
 wait_for_health() {
@@ -1205,6 +1357,7 @@ ROLE_PERMISSIONS = {
         "file:delete",
         "infra:deploy",
         "infra:destroy",
+        "tool:write",
     ),
     "demo": ("shell:read", "shell:write", "file:read", "file:write"),
 }
@@ -1282,13 +1435,6 @@ def refresh_account_integrity():
     client.hset(account_key, mapping={"_integrity_hmac": signature})
 
 if existing and not force:
-    pipe = client.pipeline()
-    for council_id in councils:
-        pipe.sadd(councils_key, council_id)
-        pipe.sadd(f"nomos:councils:{council_id}:agents", agent_id)
-    pipe.hset(account_key, mapping={"updated_at": str(time.time())})
-    pipe.execute()
-    refresh_account_integrity()
     print("NOMOS_ACCOUNT_STATUS=exists")
     print(f"NOMOS_AGENT_ID={agent_id}")
     print(f"NOMOS_ROLE={existing.get('role', role)}")
@@ -1335,21 +1481,68 @@ print(f"NOMOS_TOKEN={raw_token}")
 PY
   )"
 
-  printf '%s\n' "$output"
-
-  local token
+  local status token
+  status="$(printf '%s\n' "$output" | awk -F= '$1 == "NOMOS_ACCOUNT_STATUS" {print $2; exit}')"
   token="$(printf '%s\n' "$output" | awk -F= '$1 == "NOMOS_TOKEN" {print $2; exit}')"
-  if [[ -n "$token" ]]; then
-    set_env_var NOMOS_AGENT_ID "$AGENT_ID"
-    set_env_var NOMOS_AUTH_TOKEN "$token"
-    if [[ "$WITH_DEMO" == "1" || "$WITH_DEMO" == "true" ]]; then
-      set_env_var NOMOS_AUTH_TOKEN "$token"
-      set_env_var NOMOS_AGENT_ID "$AGENT_ID"
-    fi
-    log "Stored NOMOS_AGENT_ID and NOMOS_AUTH_TOKEN in deploy/.env"
-  else
-    log "Account already existed; token was not changed or recovered."
+  case "$status" in
+    created)
+      [[ -n "$token" ]] || die "Account creation did not return a token."
+      set_env_var "$AGENT_ID_STORE_KEY" "$AGENT_ID"
+      set_env_var "$AGENT_TOKEN_STORE_KEY" "$token"
+      log "Account state: absent; provisioned $AGENT_ID and stored protected credentials in $ENV_FILE"
+      ;;
+    rotated)
+      [[ -n "$token" ]] || die "Explicit token rotation did not return a token."
+      set_env_var "$AGENT_ID_STORE_KEY" "$AGENT_ID"
+      set_env_var "$AGENT_TOKEN_STORE_KEY" "$token"
+      log "Account state: explicit rotation requested; stored replacement credentials in $ENV_FILE"
+      ;;
+    exists)
+      if ! protected_agent_credentials_present; then
+        missing_or_unusable_agent_credentials || true
+        die "No usable protected token for $AGENT_ID; refusing to mutate an existing account."
+      fi
+      local verify_status=0
+      verify_compose_agent_token || verify_status=$?
+      case "$verify_status" in
+        0)
+          log "Account state: present; protected token verified; reusing $AGENT_ID without mutation"
+          ;;
+        "$ACCOUNT_STORE_UNAVAILABLE")
+          die "Could not reach the account store to verify $AGENT_ID; refusing to rotate a credential that may still be valid. Retry once Redis is reachable."
+          ;;
+        *)
+          missing_or_unusable_agent_credentials || true
+          die "Protected token for $AGENT_ID did not verify; refusing to mutate an existing account."
+          ;;
+      esac
+      ;;
+    *)
+      die "Could not determine account state for $AGENT_ID."
+      ;;
+  esac
+}
+
+# Exit status: 0 verified, ACCOUNT_STORE_UNAVAILABLE the store could not be
+# reached (answer unknown), anything else the token genuinely does not
+# authenticate. Only the last of those may lead to rotation advice — a Redis
+# outage must not be reported to the operator as an unusable credential.
+verify_compose_agent_token() {
+  local candidate_token output status=0
+  candidate_token="$(protected_agent_token)" || return 1
+  # The URL is assembled inside the container from the council service's own
+  # COUNCIL_REDIS_* environment, as the Kind path already does. Passing it as a
+  # Compose argument would put the Redis password in the deploying host's process
+  # list. Sentinel topologies need no special case here: agent_accounts.py reads
+  # COUNCIL_REDIS_MODE and COUNCIL_REDIS_SENTINEL_* from that same environment.
+  output="$(printf '%s' "$candidate_token" | compose run --rm --no-deps -T \
+    --entrypoint sh council -c \
+    'exec python scripts/agent_accounts.py verify-token --token-stdin --expect-council "$2" "$1"' \
+    sh "$AGENT_ID" "$AGENT_COUNCILS" 2>&1)" || status=$?
+  if (( status != 0 )); then
+    printf '%s\n' "$output" >&2
   fi
+  return "$status"
 }
 
 kind_council_deployment() {
@@ -1365,8 +1558,10 @@ sync_kind_agent_secret() {
 
   local patch_file
   patch_file="$(mktemp)"
-  printf '{"data":{"NOMOS_AGENT_ID":"%s","NOMOS_AUTH_TOKEN":"%s"}}\n' \
+  printf '{"data":{"%s":"%s","%s":"%s"}}\n' \
+    "$AGENT_ID_STORE_KEY" \
     "$(printf '%s' "$AGENT_ID" | base64 | tr -d '\n')" \
+    "$AGENT_TOKEN_STORE_KEY" \
     "$(printf '%s' "$token" | base64 | tr -d '\n')" >"$patch_file"
   if ! kubectl_kind -n "$KIND_NAMESPACE" patch secret "$KIND_SECRET_NAME" \
     --type merge \
@@ -1380,15 +1575,20 @@ sync_kind_agent_secret() {
 store_kind_agent_token() {
   local token="$1"
   if is_true "$KIND_USE_EXISTING_SECRET_ONLY"; then
+    # sync_kind_agent_secret treats an absent Secret as a no-op success, which in
+    # existing-secret-only mode would drop the token on the floor and still log
+    # that it was stored. There is no env file to fall back to here.
+    kind_secret_exists \
+      || die "Kubernetes Secret $KIND_NAMESPACE/$KIND_SECRET_NAME does not exist; cannot store $AGENT_TOKEN_STORE_KEY in existing-secret-only mode."
     sync_kind_agent_secret "$token"
-    log "Stored Kind NOMOS_AGENT_ID and NOMOS_AUTH_TOKEN in Kubernetes Secret $KIND_NAMESPACE/$KIND_SECRET_NAME"
+    log "Stored Kind $AGENT_ID_STORE_KEY and $AGENT_TOKEN_STORE_KEY in Kubernetes Secret $KIND_NAMESPACE/$KIND_SECRET_NAME"
     return
   fi
 
-  set_env_var NOMOS_AGENT_ID "$AGENT_ID"
-  set_env_var NOMOS_AUTH_TOKEN "$token"
+  set_env_var "$AGENT_ID_STORE_KEY" "$AGENT_ID"
+  set_env_var "$AGENT_TOKEN_STORE_KEY" "$token"
   sync_kind_agent_secret "$token"
-  log "Stored Kind NOMOS_AGENT_ID and NOMOS_AUTH_TOKEN in deploy/.env"
+  log "Stored Kind $AGENT_ID_STORE_KEY and $AGENT_TOKEN_STORE_KEY in $ENV_FILE"
 }
 
 create_kind_account() {
@@ -1401,21 +1601,58 @@ create_kind_account() {
   log "Creating Kind agent account if needed: $AGENT_ID ($AGENT_ROLE)"
   local output
   output="$(
-    kubectl_kind -n "$KIND_NAMESPACE" exec "deploy/$deployment" -c council -- \
+    # -i is required: the script below arrives on stdin as `sh -s`, and without
+    # it kubectl forwards nothing, so the shell reads an empty program, exits 0,
+    # and prints nothing. That silent no-op is what previously looked like
+    # "account already existed".
+    kubectl_kind -n "$KIND_NAMESPACE" exec -i "deploy/$deployment" -c council -- \
       env \
         AGENT_ID="$AGENT_ID" \
         AGENT_ROLE="$AGENT_ROLE" \
         AGENT_COUNCILS="$AGENT_COUNCILS" \
         AGENT_DISPLAY_NAME="$AGENT_DISPLAY_NAME" \
+        AGENT_FORCE_ROTATE="$AGENT_FORCE_ROTATE" \
       sh -s <<'SH'
 set -eu
-export NOMOS_REDIS_URL="redis://:${COUNCIL_REDIS_PASSWORD}@${COUNCIL_REDIS_HOST}:${COUNCIL_REDIS_PORT}/0"
+# NOMOS_REDIS_URL is deliberately not set: agent_accounts.py builds it from
+# COUNCIL_REDIS_HOST/PORT and reads COUNCIL_REDIS_PASSWORD directly, so the
+# password never has to survive URL quoting in shell.
+
+# Redis stores only a token hash, so an existing account's raw token cannot be
+# recovered — AGENT_FORCE_ROTATE is the documented way to mint a fresh one
+# (docs/council-mcp-validation.md). The compose path already honours it; without
+# this the Kind path silently ignored it and reported the token as unrecoverable,
+# leaving no way to obtain credentials for a redeployed cluster.
+case "${AGENT_FORCE_ROTATE:-0}" in
+  1|true|TRUE|yes|YES)
+    if python scripts/agent_accounts.py rotate-token --json "$AGENT_ID" \
+        >/tmp/nomos-agent-account.json 2>/tmp/nomos-agent-account.err; then
+      cat /tmp/nomos-agent-account.json
+      exit 0
+    fi
+    # Do not fall through. Falling through reported NOMOS_ACCOUNT_STATUS=exists
+    # for an account the operator explicitly asked to re-key, so a failed
+    # rotation looked like a successful no-op and the old token stayed live.
+    printf 'NOMOS_ACCOUNT_STATUS=rotate_failed\n'
+    cat /tmp/nomos-agent-account.err >&2 2>/dev/null || true
+    exit 1
+    ;;
+esac
 
 if python scripts/agent_accounts.py show --json "$AGENT_ID" >/tmp/nomos-agent-account.json 2>/tmp/nomos-agent-account.err; then
-  cat /tmp/nomos-agent-account.json
+  case "${AGENT_FORCE_ROTATE:-0}" in
+    1|true)
+      printf 'NOMOS_ACCOUNT_STATUS=rotated\n'
+      python scripts/agent_accounts.py rotate-token --json "$AGENT_ID"
+      ;;
+    *)
+      printf 'NOMOS_ACCOUNT_STATUS=exists\n'
+      ;;
+  esac
   exit 0
 fi
 
+printf 'NOMOS_ACCOUNT_STATUS=created\n'
 set -- create --json --role "$AGENT_ROLE" --display-name "$AGENT_DISPLAY_NAME"
 old_ifs="$IFS"
 IFS=,
@@ -1430,16 +1667,69 @@ python scripts/agent_accounts.py "$@"
 SH
   )"
 
-  printf '%s\n' "$output"
-
-  local token
+  local status token
+  status="$(printf '%s\n' "$output" | awk -F= '$1 == "NOMOS_ACCOUNT_STATUS" {print $2; exit}')"
   token="$(printf '%s\n' "$output" | awk -F'"' '$2 == "token" {print $4; exit}')"
-  if [[ -n "$token" ]]; then
-    store_kind_agent_token "$token"
+  case "$status" in
+    created)
+      [[ -n "$token" ]] || die "Kind account creation did not return a token."
+      store_kind_agent_token "$token"
+      log "Account state: absent; provisioned $AGENT_ID and stored protected credentials"
+      ;;
+    rotated)
+      [[ -n "$token" ]] || die "Explicit Kind token rotation did not return a token."
+      store_kind_agent_token "$token"
+      log "Account state: explicit rotation requested; stored replacement credentials"
+      ;;
+    exists)
+      if ! protected_agent_credentials_present; then
+        missing_or_unusable_agent_credentials || true
+        die "No usable protected token for $AGENT_ID; refusing to mutate an existing account."
+      fi
+      local verify_status=0
+      verify_kind_agent_token "$deployment" || verify_status=$?
+      case "$verify_status" in
+        0)
+          log "Account state: present; protected token verified; reusing $AGENT_ID without mutation"
+          ;;
+        "$ACCOUNT_STORE_UNAVAILABLE")
+          die "Could not reach the account store to verify $AGENT_ID; refusing to rotate a credential that may still be valid. Retry once Redis is reachable."
+          ;;
+        *)
+          missing_or_unusable_agent_credentials || true
+          die "Protected token for $AGENT_ID did not verify; refusing to mutate an existing account."
+          ;;
+      esac
+      ;;
+    *)
+      die "Could not determine Kind account state for $AGENT_ID."
+      ;;
+  esac
+  # Every branch of the case above either stores a usable credential or dies, so
+  # a deploy can no longer reach this point without one. An earlier guard
+  # checked the same property by grepping the CLI output after the fact; the
+  # status contract supersedes it and is stronger, since it
+  # also verifies a reused token against the store rather than assuming an
+  # existing account is usable.
+  if [[ "$status" == "created" || "$status" == "rotated" ]]; then
     kubectl_kind -n "$KIND_NAMESPACE" rollout restart deployment "$HELM_RELEASE-demo" >/dev/null 2>&1 || true
-  else
-    log "Kind account already existed; token was not changed or recovered."
   fi
+}
+
+# Same status contract as verify_compose_agent_token: 0 verified,
+# ACCOUNT_STORE_UNAVAILABLE store unreachable, anything else genuinely invalid.
+verify_kind_agent_token() {
+  local deployment="$1"
+  local candidate_token output status=0
+  candidate_token="$(protected_agent_token)" || return 1
+  output="$(printf '%s' "$candidate_token" | kubectl_kind -n "$KIND_NAMESPACE" exec -i \
+    "deploy/$deployment" -c council -- \
+    sh -c 'exec python scripts/agent_accounts.py verify-token --token-stdin --expect-council "$2" "$1"' \
+    sh "$AGENT_ID" "$AGENT_COUNCILS" 2>&1)" || status=$?
+  if (( status != 0 )); then
+    printf '%s\n' "$output" >&2
+  fi
+  return "$status"
 }
 
 main_compose() {
@@ -1521,8 +1811,8 @@ main_compose() {
   if [[ "$WITH_AGENT_SIGNUP" == "1" || "$WITH_AGENT_SIGNUP" == "true" ]]; then
     local agent_signup_port
     agent_signup_port="$(current_or_default AGENT_SIGNUP_PORT 9905)"
-    printf 'Agent signup:    http://%s:%s/\n' "$public_host" "$agent_signup_port"
-    printf 'Agent admin:     http://%s:%s/admin\n' "$public_host" "$agent_signup_port"
+    printf 'Agent signup:    https://%s:%s/\n' "$public_host" "$agent_signup_port"
+    printf 'Agent admin:     https://%s:%s/admin\n' "$public_host" "$agent_signup_port"
     printf 'Agent auth:      user %s, password in %s\n' "$(current_value NOMOS_SIGNUP_ADMIN_USER)" "$ENV_FILE"
   fi
   printf 'Council gRPC:    %s:%s\n' "$public_host" "$council_grpc_port"
@@ -1534,9 +1824,29 @@ main_compose() {
     printf 'OpenShell:       internal service openshell:8080\n'
   fi
   if [[ "$WITH_DEMO" == "1" || "$WITH_DEMO" == "true" ]]; then
-    printf 'Demo UI:         http://%s:%s\n' "$public_host" "$(current_or_default DEMO_PORT 8000)"
+    printf 'Demo UI:         https://%s:%s\n' "$public_host" "$(current_or_default DEMO_PORT 8000)"
   fi
   printf 'Env file:        %s\n' "$ENV_FILE"
+}
+
+# Restart the deployments running locally-built nomos/* images so a rebuild under
+# the same mutable tag takes effect.
+#
+# The infrastructure deployments run upstream images and must be excluded.
+# Restarting vault in particular BREAKS the deploy: it runs `server -dev`
+# (in-memory), and the Helm post-install hook that enables Kubernetes auth and the
+# transit keys has already run and deleted itself (hook-delete-policy:
+# hook-succeeded). A restarted vault comes back empty, nothing re-runs the
+# bootstrap, and the council's wait-for-backends init container then blocks forever
+# on `auth/kubernetes/login` with HTTP 403.
+#
+# A named function rather than an inline block so a test can invoke the real
+# selector instead of rebuilding it and asserting against its own construction.
+kind_rollout_restart_sweep() {
+  is_true "$KIND_ROLLOUT_RESTART" || return 0
+  log "Restarting Kind deployments so same-tag local images are used"
+  kubectl_kind -n "$KIND_NAMESPACE" rollout restart deployment \
+    -l "app.kubernetes.io/instance=$HELM_RELEASE,app.kubernetes.io/component notin ($KIND_NO_RESTART_COMPONENTS)"
 }
 
 main_kind() {
@@ -1578,6 +1888,11 @@ main_kind() {
     "$KIND_VALUES_FILE"
   )
 
+  if [[ -n "${KIND_COUNCIL_PROFILE_FILE:-}" ]]; then
+    [[ -f "$KIND_COUNCIL_PROFILE_FILE" ]] || die "KIND_COUNCIL_PROFILE_FILE does not exist: $KIND_COUNCIL_PROFILE_FILE"
+    helm_args+=(--set-file "council.configOverride=$KIND_COUNCIL_PROFILE_FILE")
+  fi
+
   local deploy_profile
   deploy_profile="$(current_or_default NOMOS_DEPLOY_PROFILE dev)"
   helm_args+=(--set "deploymentProfile=$deploy_profile")
@@ -1587,6 +1902,22 @@ main_kind() {
       --set "council.allowPublicBind=true"
       --set "networkPolicy.enabled=true"
     )
+  fi
+
+  # kind-values.yaml enables the chart's Ingress objects for kind-up.sh, which creates
+  # the cluster from kind-cluster.yaml (host ports 80/443) and installs ingress-nginx.
+  # This script does neither, so on a cluster it created the rendered Ingress objects
+  # would advertise *.nomos.local hostnames that nothing can serve.
+  local ingress_status
+  if kind_cluster_has_usable_ingress kubectl_kind; then
+    log "Keeping chart ingress enabled: Kind cluster $KIND_CLUSTER_NAME has IngressClass nginx, an ingress-ready=true node and host ports 80/443 mapped"
+  else
+    ingress_status=$?
+    if (( ingress_status == 2 )); then
+      die "Unable to determine ingress availability for Kind cluster $KIND_CLUSTER_NAME because a Kubernetes or Docker query failed. Verify cluster and Docker access, then retry."
+    fi
+    log "Disabling chart ingress: Kind cluster $KIND_CLUSTER_NAME lacks the nginx IngressClass, ingress-ready=true node, or exact host mappings for ports 80/443 (hostname ingress is deploy/kubernetes/scripts/kind-up.sh's path; this script uses port-forwards)"
+    helm_args+=(--set "ingress.enabled=false")
   fi
 
   if is_true "$KIND_USE_EXISTING_SECRET_ONLY"; then
@@ -1618,11 +1949,7 @@ main_kind() {
     return 1
   fi
 
-  if is_true "$KIND_ROLLOUT_RESTART"; then
-    log "Restarting Kind deployments so same-tag local images are used"
-    kubectl_kind -n "$KIND_NAMESPACE" rollout restart deployment \
-      -l "app.kubernetes.io/instance=$HELM_RELEASE"
-  fi
+  kind_rollout_restart_sweep
 
   log "Waiting for Kind deployment rollouts"
   wait_kind_rollouts || die "gave up waiting for some deployments — see the diagnostics above"
@@ -1652,6 +1979,8 @@ main() {
       return 0
       ;;
   esac
+
+  require_supported_bash
 
   case "$DEPLOY_TARGET" in
     kind|kubernetes)

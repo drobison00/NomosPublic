@@ -1,14 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 #
 # Run the Nomos account CLI from inside the council container.
@@ -73,6 +65,12 @@ have_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+require_supported_bash() {
+  if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    die "Bash 4.3 or newer is required; found ${BASH_VERSION}. Install a newer Bash and ensure it appears first on PATH."
+  fi
+}
+
 compose() {
   local -a compose_files=()
   compose_file_args compose_files
@@ -129,6 +127,7 @@ if [[ "$1" == "-h" || "$1" == "--help" ]]; then
   exit 0
 fi
 
+require_supported_bash
 have_cmd docker || die "Docker is not installed or not on PATH."
 docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required."
 COMPOSE_REDIS_TOPOLOGY="$(current_value COMPOSE_REDIS_TOPOLOGY)"

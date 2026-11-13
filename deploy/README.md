@@ -1,13 +1,6 @@
 <!--
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-
-NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-property and proprietary rights in and to this material, related
-documentation and any modifications thereto. Any use, reproduction,
-disclosure or distribution of this material and related documentation
-without an express license agreement from NVIDIA CORPORATION or
-its affiliates is strictly prohibited.
+SPDX-License-Identifier: Apache-2.0
 -->
 
 # Nomos local dev deployments
@@ -26,9 +19,15 @@ This page covers **docker-compose**. For Kind, see [`kubernetes/README.md`](kube
 ## Prerequisites
 
 - **Docker Engine** running, plus the **`docker compose` v2** plugin (`docker compose version`).
-- An **LLM API key** — NVIDIA (`NVIDIA_API_KEY`), Anthropic, or OpenAI. The council validates
-  `llm_backends` at boot and crash-loops without one. The first run prompts for it; or put it in
-  `deploy/.env` beforehand.
+- An `NVIDIA_API_KEY` for the default models routed through NVIDIA API Catalog
+  NIM inference endpoints. Choose **Generate API Key** for a model on
+  [build.nvidia.com](https://build.nvidia.com/) and put it in `deploy/.env`, or
+  let the first run prompt for it. These hosted endpoints are intended for
+  evaluation and trial use. For production deployments, use a self-hosted
+  NVIDIA NIM endpoint or another production-suitable inference backend, such
+  as the documented direct-provider alternatives. Review the
+  [NVIDIA API Trial Terms](https://assets.ngc.nvidia.com/products/api-catalog/legal/NVIDIA%20API%20Trial%20Terms%20of%20Service.pdf)
+  before relying on the hosted API Catalog endpoints.
 
 Nothing else to set up — every other secret is generated for you.
 
@@ -47,8 +46,8 @@ idempotent and reuse `deploy/.env`. Add `-y` to skip all prompts (the LLM key mu
 `compose-up.sh` runs, in order:
 
 1. **Preflight** — checks `docker` + the `docker compose` v2 plugin.
-2. **LLM key (required)** — prompts for `NVIDIA_API_KEY` (or Anthropic/OpenAI); the council
-   validates `llm_backends` at boot and crash-loops without one. Stored in `deploy/.env`.
+2. **LLM key (required)** — prompts for `NVIDIA_API_KEY`; the council
+   validates these NIM backends at boot. Stored in `deploy/.env`.
 3. **Dev secrets** — auto-generates and persists every secret (redis password, account
    integrity key, dashboard/signup passwords, Postgres password, Vault dev root token, MCP
    proxy token, …) to the gitignored `deploy/.env` (`0600`). Idempotent: existing values are
@@ -68,7 +67,7 @@ On success it prints the published URLs + credentials (also in `deploy/.env`):
 | council `/mcp` (gateway) | `http://localhost:9900/mcp` | `Authorization: Bearer <MONITOR_MCP_PROXY_TOKEN>` |
 | monitor dashboard | `http://localhost:9901/` | `MONITOR_DASHBOARD_USER` / `…_PASSWORD` |
 | agent-signup console | `https://localhost:9905/` | `NOMOS_SIGNUP_ADMIN_USER` / `…_PASSWORD` |
-| demo UI | `http://localhost:8000/` | — |
+| demo UI | `https://localhost:8000/` | — |
 
 ## Other commands
 
@@ -79,13 +78,46 @@ deploy/scripts/compose-down.sh                         # tear down + clear volum
 deploy/scripts/compose-down.sh --keep-volumes          # stop without clearing volumes
 ```
 
+## Using other model backends
+
+For a ready-to-run local NIM with pure local or mixed local/API Catalog
+routing, run `deploy/scripts/self-hosted-up.sh --target compose --mode pure`
+or `--mode mixed`. See the [self-hosted models guide](../docs/self-hosted-models.md)
+for hardware, credentials, and role selection. The same guide covers an
+existing self-hosted endpoint.
+
+The active Compose service-mode profile is `deploy/dynamic-config/council.yaml`.
+The bootstrap restricts this directory to its owner and `COUNCIL_CONFIG_GID`,
+which is saved in `deploy/.env` and added to the council container's groups.
+It defaults to the deploying user's primary group. On shared hosts, set it to
+a dedicated Nomos group your account belongs to; all members can edit council
+configuration. Newly created entries inherit the group through setgid directories.
+
+That file includes a commented mixed-model example (different NVIDIA API Catalog
+models per voting member) and a commented direct-vendor example (Anthropic or
+OpenAI). To activate either example:
+
+1. Update backend definitions and every member, chairman, and code-review
+   reference in the live profile.
+2. Put the matching provider key in `deploy/.env`. API Catalog backends continue
+   to use `NVIDIA_API_KEY`. For direct vendors, see
+   [Anthropic authentication](https://platform.claude.com/docs/en/manage-claude/authentication)
+   or the [OpenAI quickstart](https://developers.openai.com/api/docs/quickstart).
+3. Set `ALLOW_MISSING_NVIDIA_API_KEY=1` if the profile no longer uses NVIDIA inference.
+4. Recreate the council so it picks up the new profile and environment.
+
+For how the live profile relates to the shipped template, and the equivalent
+steps for Kind, see
+[changing the council model configuration](../docs/deployment-setup.md#changing-the-council-model-configuration).
+
 ## How it is wired
 
 - **Layered compose files** — `docker-compose.yml` (base) + `docker-compose.redis-sentinel.yml`
   (3 redis nodes + 3 sentinels) + `docker-compose.service.yml` (this overlay: adds `postgres`,
   `vault`, `council-gateway`, and flips council/executor/monitor/agent-signup to service mode).
-  The `dc()` helper in `scripts/dev-lib.sh` composes all three with the `executor-openshell`
-  profile.
+  The `dc()` helper in `scripts/dev-lib.sh` composes the base plus the redis topology
+  overlay, and adds any file named in `COMPOSE_EXTRA_FILES` (which is how the service
+  overlay is applied), with the `executor-openshell` profile.
 - **Vault (AppRole)** — compose has no Kubernetes API, so the council/executor authenticate to
   Vault with `VAULT_ROLE_ID` / `VAULT_SECRET_ID` (the only non-k8s auth the app supports). The
   dev Vault is `server -dev` (in-memory) — its keys are **ephemeral**, so `compose-down.sh`
@@ -94,8 +126,12 @@ deploy/scripts/compose-down.sh --keep-volumes          # stop without clearing v
   token-gated `/mcp` entrypoint: `Bearer <MONITOR_MCP_PROXY_TOKEN>` → council, anything else →
   `401`. The monitor remains the internal proxy + dashboard and reads the ledger via the council
   API (`MONITOR_LEDGER_SOURCE=api`).
-- **agent-signup** runs the service-mode (Postgres) console only when built from the
-  `feat/onboarding-console` image; otherwise it is reported as a non-fatal soft failure.
+- **agent-signup** runs the service-mode (Postgres) console. If the service is not
+  healthy, verification reports it as a non-fatal soft failure.
 
 All generated credentials live in `deploy/.env` (gitignored). Re-running `compose-up.sh` is
 idempotent; it re-bootstraps Vault (the dev server is in-memory) and reuses the `.env` values.
+The demo agent's token is reused once `agent_accounts.py verify-token` confirms it against the
+store; if it is missing or no longer verifies, the run stops with recovery choices instead of
+re-keying. `AGENT_FORCE_ROTATE=1` deliberately mints a new token (the `demo` service is
+recreated with it, since it reads the token only at startup).

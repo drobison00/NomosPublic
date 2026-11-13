@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """Council MCP monitor — FastAPI app.
 
@@ -97,7 +89,7 @@ def _build_stats_reader(window_seconds: float, history_limit: int) -> RedisStats
     stream = os.environ.get("MONITOR_STATS_STREAM", "nomos:council:telemetry")
     try:
         client = create_redis_client(config)
-    except Exception as exc:  # noqa: BLE001 - bad config must not crash startup
+    except Exception as exc:  # bad config must not crash startup
         logger.warning("MONITOR_STATS_SOURCE=redis but client init failed: %s", exc)
         return None
     logger.info("monitor stats source: redis stream %s (mode=%s)", stream, config.mode)
@@ -265,7 +257,10 @@ def build_app(
     # eagerly rather than in a lifespan handler because httpx ASGITransport
     # (used in tests) doesn't fire lifespan events. Process exit closes the
     # sockets — explicit shutdown isn't necessary for correctness.
-    client_kwargs: dict[str, Any] = {"timeout": httpx.Timeout(60.0)}
+    # Must exceed the council's own budget (llm_retry_budget_seconds), or the
+    # proxy abandons a request the council would have answered. Council members
+    # run in parallel, so this bounds the slowest member, not their sum.
+    client_kwargs: dict[str, Any] = {"timeout": httpx.Timeout(180.0)}
     if upstream_transport is not None:
         client_kwargs["transport"] = upstream_transport
     app.state.metrics = registry
@@ -314,15 +309,18 @@ def build_app(
             registry=app.state.metrics,
         )
 
+    async def stats_registry() -> MetricsRegistry:
+        """The registry the dashboard reads: the Redis replay when configured."""
+        reader: RedisStatsReader | None = app.state.stats_reader
+        return await reader.registry() if reader is not None else registry
+
     @app.get("/api/metrics")
     async def metrics() -> dict[str, Any]:
-        reader = app.state.stats_reader
-        snap = await (reader.snapshot() if reader is not None else app.state.metrics.snapshot())
-        return snap.to_dict()
+        return (await (await stats_registry()).snapshot()).to_dict()
 
     @app.get("/api/export.csv")
     async def export_csv() -> Response:
-        snap = await app.state.metrics.snapshot()
+        snap = await (await stats_registry()).snapshot()
         return Response(
             content=_snapshot_to_csv(snap),
             media_type="text/csv",
@@ -333,7 +331,7 @@ def build_app(
     async def recent(limit: int = 50) -> dict[str, Any]:
         # Cap to avoid unbounded responses if a client typos a huge limit.
         limit = max(1, min(limit, 500))
-        rows = await app.state.metrics.recent(limit=limit)
+        rows = await (await stats_registry()).recent(limit=limit)
         return {"rows": [row.to_dict() for row in rows]}
 
     @app.get("/api/ledger")
@@ -485,6 +483,7 @@ def _snapshot_to_csv(snap: Snapshot) -> str:
         ("decisions_total", snap.decisions_total),
     ]:
         writer.writerow(["summary", "monitor", metric, value])
+    writer.writerow(["summary", "monitor", "stats_source", snap.stats_source])
 
     _write_counter_rows(writer, "source_total", snap.by_source_total)
     _write_counter_rows(writer, "tool_total", snap.by_tool_total)
@@ -497,6 +496,9 @@ def _snapshot_to_csv(snap: Snapshot) -> str:
     _write_counter_rows(writer, "code_review_total", snap.by_code_review_total)
     _write_latency_rows(writer, "stage_latency", snap.council_stage_latency)
     _write_latency_rows(writer, "actor_latency", snap.council_actor_latency)
+    for row in snap.llm_tokens.get("retained", {}).get("by_member", []):
+        for metric in ("calls", "input", "output", "total"):
+            writer.writerow(["llm_tokens", row["member_id"], metric, row[metric]])
     return out.getvalue()
 
 

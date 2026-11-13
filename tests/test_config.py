@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """
 Tests for configuration system.
@@ -15,6 +7,7 @@ Tests for configuration system.
 
 import os
 import tempfile
+from pathlib import Path
 
 import pytest
 import yaml
@@ -299,8 +292,40 @@ class TestCouncilSettings:
         assert settings.opa.relaxed_working_dir_prefixes == []
 
     def test_chairman_quorum_is_opt_in(self):
+        assert ChairmanConfig().enabled is False
         assert ChairmanConfig().allow_quorum is False
-        assert ChairmanConfig(allow_quorum=True).allow_quorum is True
+        assert CouncilSettings().chairman.enabled is False
+        assert CouncilSettings().chairman.allow_quorum is False
+        assert ChairmanConfig(enabled=True, allow_quorum=True).allow_quorum is True
+
+    @pytest.mark.parametrize("enabled,allow_quorum", [(False, False), (True, False), (True, True)])
+    def test_chairman_valid_modes(self, enabled, allow_quorum):
+        config = ChairmanConfig(enabled=enabled, allow_quorum=allow_quorum)
+        assert config.enabled is enabled
+        assert config.allow_quorum is allow_quorum
+
+    @pytest.mark.parametrize(
+        "chairman",
+        [
+            {"enabled": False, "allow_quorum": True},
+            {"allow_quorum": True},
+            {"enabled": "false", "allow_quorum": "true"},
+        ],
+    )
+    def test_chairman_rejects_quorum_when_disabled(self, chairman):
+        with pytest.raises(ValidationError, match=r"chairman\.allow_quorum") as exc:
+            ChairmanConfig(**chairman)
+        assert "chairman.allow_quorum=true requires chairman.enabled=true" in str(exc.value)
+        assert "Set chairman.enabled=true" in str(exc.value)
+        assert "set chairman.allow_quorum=false" in str(exc.value)
+
+    def test_nested_chairman_rejects_quorum_when_disabled(self):
+        with pytest.raises(ValidationError, match=r"chairman\.allow_quorum"):
+            CouncilSettings.model_validate({"chairman": {"enabled": False, "allow_quorum": True}})
+
+    def test_chairman_parallel_member_evaluation_defaults_on_and_can_be_disabled(self):
+        assert ChairmanConfig().parallel_member_evaluation is True
+        assert ChairmanConfig(parallel_member_evaluation=False).parallel_member_evaluation is False
 
     def test_allow_uncertified_evidence_resolves_deployment_env_var(self, monkeypatch):
         monkeypatch.delenv("COUNCIL_ALLOW_UNCERTIFIED_EVIDENCE", raising=False)
@@ -447,6 +472,75 @@ class TestLoadConfig:
         assert settings.members[0].id == "reviewer-1"
 
         os.unlink(f.name)
+
+    def test_parallel_member_evaluation_round_trips_through_yaml(self):
+        config_data = {
+            "council_id": "parallel-yaml",
+            "require_auth": False,
+            "llm_backends": {},
+            "members": [],
+            "chairman": {"parallel_member_evaluation": False},
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            f.flush()
+            settings = load_config(f.name)
+
+        assert settings.chairman.parallel_member_evaluation is False
+        assert settings.model_dump()["chairman"]["parallel_member_evaluation"] is False
+        os.unlink(f.name)
+
+    @pytest.mark.parametrize(
+        "relative_path",
+        [
+            "configs/council.yaml",
+            "deploy/kubernetes/nomos/files/council/council.yaml",
+        ],
+    )
+    def test_parallel_member_evaluation_enabled_in_supported_yaml_mirrors(self, relative_path):
+        repository_root = Path(__file__).resolve().parents[1]
+        config = yaml.safe_load((repository_root / relative_path).read_text())
+
+        assert config["chairman"]["parallel_member_evaluation"] is True
+
+    @pytest.mark.parametrize("loader", [load_config, load_council_catalog])
+    @pytest.mark.parametrize(
+        "enabled,allow_quorum", [(False, False), (False, True), (True, False), (True, True)]
+    )
+    def test_load_chairman_modes(self, tmp_path, monkeypatch, loader, enabled, allow_quorum):
+        monkeypatch.setenv("NOMOS_DEPLOY_PROFILE", "development")
+        path = tmp_path / "council.yaml"
+        path.write_text(
+            yaml.safe_dump({"chairman": {"enabled": enabled, "allow_quorum": allow_quorum}})
+        )
+        if allow_quorum and not enabled:
+            with pytest.raises(ValidationError, match=r"chairman\.allow_quorum"):
+                loader(str(path))
+        else:
+            loaded = loader(str(path))
+            settings = loaded if isinstance(loaded, CouncilSettings) else loaded.get()
+            assert settings.chairman.enabled is enabled
+            assert settings.chairman.allow_quorum is allow_quorum
+
+    @pytest.mark.parametrize("loader", [load_config, load_council_catalog])
+    @pytest.mark.parametrize("use_reference", [False, True])
+    def test_load_catalog_rejects_merged_disabled_quorum(
+        self, tmp_path, monkeypatch, loader, use_reference
+    ):
+        monkeypatch.setenv("NOMOS_DEPLOY_PROFILE", "development")
+        base = {"chairman": {"enabled": True, "allow_quorum": True}}
+        override = {"chairman": {"enabled": False}}
+        catalog = {"default_council_id": "sample", "councils": {"sample": override}}
+        if use_reference:
+            (tmp_path / "profile.yaml").write_text(yaml.safe_dump(base))
+            override["config_file"] = "profile.yaml"
+        else:
+            catalog["shared"] = base
+        path = tmp_path / "catalog.yaml"
+        path.write_text(yaml.safe_dump(catalog))
+        with pytest.raises(ValidationError, match=r"chairman\.allow_quorum"):
+            loader(str(path))
 
     def test_load_nonexistent_file(self):
         with pytest.raises(FileNotFoundError):
@@ -844,3 +938,63 @@ class TestLoadConfig:
         assert catalog.get("council-a").nat.host == "0.0.0.0"  # noqa: S104
         assert catalog.get("council-a").nat.port == 9901
         assert catalog.get("council-a").nat.server_name == "Shared MCP"
+
+
+class TestUnenforcedSecurityControls:
+    """Config may not claim a security control the runtime does not apply.
+
+    These keys were accepted and silently ignored by earlier revisions. Removing
+    them from the models is not enough on its own: Pydantic's default
+    ``extra="ignore"`` would keep dropping them in silence, which is the same
+    false sense of security the executor guards against in
+    ``executors/docker/config.py::_validate_unimplemented_fields``.
+    """
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("require_mfa", True),
+            ("require_cryptographic_auth", True),
+            ("allowed_environments", ["prod"]),
+            ("max_risk_level", "low"),
+            ("auto_approve_patterns", ["^ls "]),
+            ("cooldown_seconds", 30),
+        ],
+    )
+    def test_member_level_unenforced_control_blocks_startup(self, key, value):
+        member = {
+            "id": "reviewer",
+            "backend": "b",
+            "priorities": ["safety"],
+            key: value,
+        }
+        with pytest.raises(ValidationError) as exc:
+            CouncilMemberConfig.model_validate(member)
+        rendered = str(exc.value)
+        assert key in rendered
+        assert "not enforced" in rendered
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("audit", {"webhook_url": "https://siem.example.com/hook"}),
+            ("agent_auth", {"require_agent_signatures": True}),
+        ],
+    )
+    def test_council_level_unenforced_block_blocks_startup(self, key, value):
+        with pytest.raises(ValidationError) as exc:
+            CouncilSettings.model_validate({"council_id": "c", key: value})
+        rendered = str(exc.value)
+        assert key in rendered
+        assert "not enforced" in rendered
+
+    def test_unrelated_extra_keys_still_load(self):
+        """The guard names specific keys; it is not a blanket extra="forbid"."""
+        settings = CouncilSettings.model_validate({"council_id": "council-x", "some_future_key": 1})
+        assert settings.council_id == "council-x"
+
+    def test_a_member_without_those_keys_is_unaffected(self):
+        member = CouncilMemberConfig.model_validate(
+            {"id": "reviewer", "backend": "b", "priorities": ["safety"]}
+        )
+        assert member.id == "reviewer"

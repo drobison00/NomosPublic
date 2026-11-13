@@ -1,13 +1,6 @@
 <!--
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-
-NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-property and proprietary rights in and to this material, related
-documentation and any modifications thereto. Any use, reproduction,
-disclosure or distribution of this material and related documentation
-without an express license agreement from NVIDIA CORPORATION or
-its affiliates is strictly prohibited.
+SPDX-License-Identifier: Apache-2.0
 -->
 
 <!doctype html>
@@ -38,7 +31,7 @@ its affiliates is strictly prohibited.
     <nav class="nav">
       <a href="../index.md">Docs index</a>
       <a href="../council-mcp-validation.md">Validation checklist</a>
-      <a href="../../README.md#mcp-tools-reference">MCP tools reference</a>
+      <a href="../reference/mcp-api.md#mcp-tools-reference">MCP tools reference</a>
       <a href="multi-council.html">Multi-council routing</a>
       <a href="workflow.html">Runtime workflow</a>
     </nav>
@@ -179,7 +172,7 @@ uv run pytest \
       </table>
     </section>
 
-    <footer>Reference: <a href="../../README.md#mcp-tools-reference">README MCP tools reference</a>.</footer>
+    <footer>Reference: <a href="../reference/mcp-api.md#mcp-tools-reference">MCP tools reference</a>.</footer>
   </main>
 
   <script>
@@ -213,6 +206,7 @@ uv run pytest \
         command: els.command.value,
         working_directory: "/workspace/projects/example",
         description: "Inspect repository state before making changes.",
+        context: "Task: fix the failing unit test in the example project; nothing changed yet.",
         target_resource: "/workspace/projects/example",
         justification: "Need to understand current worktree state before continuing.",
         blast_radius: "Read-only repository inspection"
@@ -221,7 +215,7 @@ uv run pytest \
       if (els.attachments.value === "script") {
         out.packaged_files = [{
           path: "scripts/inspect.sh",
-          content_b64: "<base64-encoded-file-content>",
+          content_base64: "<base64-encoded-file-content>",
           sha256: "example-sha256-of-decoded-content",
           mode: "0755"
         }];
@@ -230,9 +224,9 @@ uv run pytest \
     }
 
     function expectedResult() {
-      if (els.tool.value === "public_key") return { public_key: "hex-encoded-ed25519-public-key", key_id: "current" };
-      if (els.tool.value === "writ_status") return { writ_id: "writ-019c4e848c7774e6c2d7", status: "executed", exit_code: 0 };
-      if (els.tool.value === "propose") return { status: "approved | denied", guidance: [], writ: null, council_members: ["..."], chairman: {"risk_level": "low"} };
+      if (els.tool.value === "public_key") return { council_id: "council-prod", public_key_hex: "hex-encoded-ed25519-public-key", fingerprint: "sha256-of-the-public-key", key_id: "nomos-council" };
+      if (els.tool.value === "writ_status") return { writ_id: "writ-019c4e848c7774e6c2d7", status: "valid | expired | used | not_found", issued_at: 1739226000.0, expires_at: 1739226300.0, command: "git status --short" };
+      if (els.tool.value === "propose") return { success: true, intent_id: "intent-...", state: "approved | denied | awaiting_approval", requires_approval: false, council_members: ["..."], chairman: {"risk_level": "low"} };
       return { status: "approved | denied", writ_id: "writ-...", writ: "<base64 blob if approved>", guidance: [], council_members: ["..."], chairman: {"risk_level": "low"} };
     }
 

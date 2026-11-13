@@ -1,20 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """
-NVIDIA Cloud Functions (NVCF) inference backend.
+NVIDIA Inference Hub backend.
 
 Targets https://inference-api.nvidia.com/v1/ — distinct from the NIM catalog
 endpoint at integrate.api.nvidia.com used by NIMBackend. Model ids use the
-nvcf/ prefix (e.g. nvcf/meta/llama-3.1-70b-instruct).
+provider-specific identifiers accepted by NVIDIA Inference Hub.
 
 OpenAI-compatible API; requires: pip install openai
 """
@@ -28,15 +20,29 @@ from .base import LLMBackend, LLMMessage, LLMResponse
 NO_TEMPERATURE_MODELS = frozenset(
     {
         "aws/anthropic/bedrock-claude-opus-4-7",
+        "azure/anthropic/claude-sonnet-5",
         "openai/openai/gpt-5.5",
+        "openai/openai/gpt-5.6-terra",
+    }
+)
+
+NO_RESPONSE_FORMAT_MODELS = frozenset(
+    {
+        "openai/openai/gpt-5.6-terra",
+    }
+)
+
+MAX_COMPLETION_TOKENS_MODELS = frozenset(
+    {
+        "openai/openai/gpt-5.6-terra",
     }
 )
 
 
 class NVInferenceBackend(LLMBackend):
-    """NVIDIA Cloud Functions inference backend (OpenAI-compatible API)."""
+    """NVIDIA Inference Hub backend (OpenAI-compatible API)."""
 
-    DEFAULT_BASE_URL = "https://inference-api.nvidia.com"
+    DEFAULT_BASE_URL = "https://inference-api.nvidia.com/v1"
 
     def __init__(
         self,
@@ -67,6 +73,10 @@ class NVInferenceBackend(LLMBackend):
         self._model = model
         self._top_p = top_p
         self._send_temperature = model not in NO_TEMPERATURE_MODELS
+        self._send_response_format = model not in NO_RESPONSE_FORMAT_MODELS
+        self._max_tokens_parameter = (
+            "max_completion_tokens" if model in MAX_COMPLETION_TOKENS_MODELS else "max_tokens"
+        )
 
     async def complete(
         self,
@@ -78,15 +88,15 @@ class NVInferenceBackend(LLMBackend):
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": [{"role": m.role.value, "content": m.content} for m in messages],
-            "max_tokens": max_tokens,
+            self._max_tokens_parameter: max_tokens,
         }
         if self._send_temperature:
             kwargs["temperature"] = temperature
         if self._top_p is not None:
-            # Some NVCF-routed models (notably Bedrock Claude) reject temperature +
+            # Some Inference Hub models (notably Bedrock Claude) reject temperature +
             # top_p together. Only send top_p when the caller explicitly set it.
             kwargs["top_p"] = self._top_p
-        if response_format:
+        if response_format and self._send_response_format:
             kwargs["response_format"] = response_format
 
         response = await self._client.chat.completions.create(**kwargs)

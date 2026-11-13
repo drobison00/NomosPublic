@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Verify a running Nomos Kind dev stack: pod readiness, council MCP, gateway
 # token-gate, monitor/signup health, ingress routing, Postgres durable state,
@@ -20,6 +13,8 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../../scripts/dev-lib.sh
 . "$SCRIPT_DIR/../../scripts/dev-lib.sh"
+# shellcheck source=../../scripts/kind-ingress.sh
+. "$SCRIPT_DIR/../../scripts/kind-ingress.sh"
 
 AGENT_ID="${AGENT_ID:-${NOMOS_AGENT_ID:-$(env_get NOMOS_AGENT_ID)}}"
 AGENT_ID="${AGENT_ID:-dev-agent}"
@@ -31,8 +26,8 @@ pass() { ok "$1"; PASS=$((PASS + 1)); }
 fail() { printf '  %s\xe2\x9c\x97%s %s\n' "$C_R" "$C_0" "$1" >&2; FAIL=$((FAIL + 1)); }
 check() { local label="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$label"; else fail "$label"; fi; }
 
-_deploy_ready() { [ "$(kcn get deploy "nomos-$1" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)" -ge 1 ]; }
-_sts_ready()    { [ "$(kcn get statefulset "nomos-$1" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)" -ge 1 ]; }
+_deploy_ready() { [[ "$(kcn get deploy "nomos-$1" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)" -ge 1 ]]; }
+_sts_ready()    { [[ "$(kcn get statefulset "nomos-$1" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)" -ge 1 ]]; }
 
 log "Verifying Nomos stack (namespace: $NAMESPACE, cluster: kind-$KIND_CLUSTER_NAME)"
 
@@ -43,9 +38,9 @@ check "statefulset redis ready"    _sts_ready redis
 for d in vault council council-gateway council-grpc monitor executor-openshell openshell opa; do
   check "deploy nomos-$d ready" _deploy_ready "$d"
 done
-# agent-signup needs the feat/onboarding-console image to run in postgres mode; soft check.
+# agent-signup is not required for agent registration; soft check.
 if _deploy_ready agent-signup; then pass "deploy nomos-agent-signup ready"
-else warn "deploy nomos-agent-signup NOT ready — build its image from feat/onboarding-console (service-mode console); non-fatal"; fi
+else warn "deploy nomos-agent-signup NOT ready (service-mode console); non-fatal"; fi
 
 # ── internal + ingress HTTP ─────────────────────────────────────────────
 log "Service + ingress health"
@@ -58,15 +53,23 @@ check "council MCP tools registered" kcn exec deploy/nomos-council -c council --
 # which hits published ports directly. Helper functions (not `bash -c`) so `check`
 # runs them in-process and they can see _code + the script's vars.
 _code() { curl -sk -o /dev/null -m 8 -w '%{http_code}' "$@"; }
-_ing_gw_healthz() { [ "$(_code -H 'Host: mcp.nomos.local' http://localhost/healthz)" = 200 ]; }
-_ing_gw_noauth()  { [ "$(_code -X POST -H 'Host: mcp.nomos.local' http://localhost/mcp)" = 401 ]; }
-_ing_monitor_up() { [ "$(_code -H 'Host: monitor.nomos.local' http://localhost/)" != 000 ]; }
-check "ingress: gateway /healthz = 200"       _ing_gw_healthz
-check "ingress: gateway /mcp no-bearer = 401"  _ing_gw_noauth
-check "ingress: monitor reachable"             _ing_monitor_up
-if [ "$(_code -H 'Host: signup.nomos.local' https://localhost/healthz)" = 200 ]; then
-  pass "ingress: agent-signup /healthz = 200"
-else warn "ingress: agent-signup /healthz != 200 (see onboarding-console note); non-fatal"; fi
+_ing_gw_healthz() { [[ "$(_code -H 'Host: mcp.nomos.local' http://localhost/healthz)" = 200 ]]; }
+_ing_gw_noauth()  { [[ "$(_code -X POST -H 'Host: mcp.nomos.local' http://localhost/mcp)" = 401 ]]; }
+_ing_monitor_up() { [[ "$(_code -H 'Host: monitor.nomos.local' http://localhost/)" != 000 ]]; }
+if kind_cluster_has_usable_ingress kc; then
+  check "ingress: gateway /healthz = 200"        _ing_gw_healthz
+  check "ingress: gateway /mcp no-bearer = 401"  _ing_gw_noauth
+  check "ingress: monitor reachable"             _ing_monitor_up
+  if [[ "$(_code -H 'Host: signup.nomos.local' https://localhost/healthz)" = 200 ]]; then
+    pass "ingress: agent-signup /healthz = 200"
+  else warn "ingress: agent-signup /healthz != 200; non-fatal"; fi
+else
+  ingress_status=$?
+  if (( ingress_status == 2 )); then
+    die "Unable to determine ingress availability for Kind cluster $KIND_CLUSTER_NAME because a Kubernetes or Docker query failed. Verify cluster and Docker access, then retry."
+  fi
+  warn "ingress checks skipped: Kind cluster $KIND_CLUSTER_NAME lacks the nginx IngressClass, ingress-ready=true node, or exact host mappings for ports 80/443. Hostname ingress is deploy/kubernetes/scripts/kind-up.sh's path; scripts/deploy_stack.sh uses port-forwards."
+fi
 
 # ── durable state ───────────────────────────────────────────────────────
 log "Postgres durable state"
@@ -78,11 +81,11 @@ async def m():
     s=PostgresStore(os.environ['COUNCIL_DATABASE_URL']); await s.connect()
     n=len(await s.list_account_ids()); await s.close(); print(n)
 asyncio.run(m())" 2>/dev/null | tail -n1 || echo 0)
-if [ "${acct_ok:-0}" -ge 1 ]; then pass "Postgres has >=1 registered account ($acct_ok)"; else fail "Postgres has no accounts (registration?)"; fi
+if [[ "${acct_ok:-0}" -ge 1 ]]; then pass "Postgres has >=1 registered account ($acct_ok)"; else fail "Postgres has no accounts (registration?)"; fi
 
 # ── functional: authorize -> writ -> execute -> evidence ────────────────
 log "Functional flow (authorize -> writ -> execute -> signed evidence)"
-if [ -z "$AGENT_TOKEN" ]; then
+if [[ -z "$AGENT_TOKEN" ]]; then
   fail "no AGENT_TOKEN available — cannot run the functional flow"
 else
   # Driven from INSIDE the council pod, addressing peers by in-cluster Service DNS:
@@ -131,7 +134,7 @@ fi
 
 # ── verdict ─────────────────────────────────────────────────────────────
 echo
-if [ "$FAIL" -eq 0 ]; then
+if [[ "$FAIL" -eq 0 ]]; then
   log "${C_G}VERIFY PASSED${C_0} — $PASS checks OK"
 else
   die "VERIFY FAILED — $FAIL failed, $PASS passed"

@@ -1,13 +1,6 @@
 <!--
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-
-NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-property and proprietary rights in and to this material, related
-documentation and any modifications thereto. Any use, reproduction,
-disclosure or distribution of this material and related documentation
-without an express license agreement from NVIDIA CORPORATION or
-its affiliates is strictly prohibited.
+SPDX-License-Identifier: Apache-2.0
 -->
 
 <!DOCTYPE html>
@@ -227,9 +220,17 @@ footer a:hover{color:var(--app);border-bottom-color:rgba(159,226,74,.4)}
   <div class="grid four">
     <div class="card"><h3 style="font-size:14px">1. propose_intent</h3><p style="font-size:12px">Agent POSTs MCP tools/call with <code>auth_token</code> + intent fields. Council enqueues the workflow.</p></div>
     <div class="card cfg"><h3 style="font-size:14px">2. review &amp; sign</h3><p style="font-size:12px">OPA preflight → council members vote → chairman picks threshold → Ed25519 signs the writ.</p></div>
-    <div class="card"><h3 style="font-size:14px">3. fetch the writ</h3><p style="font-size:12px">Agent polls <code>check_proposal_status</code>; when approved, retrieves <code>writ_blob</code> (base64).</p></div>
+    <div class="card"><h3 style="font-size:14px">3. receive the writ</h3><p style="font-size:12px">The signed <code>writ</code> (base64) comes back from the same <code>council_authorize</code> call. There is no separate fetch step, and no polling: the writ belongs to the evaluation you just read.</p></div>
     <div class="card sec"><h3 style="font-size:14px">4. submit + execute</h3><p style="font-size:12px">Agent POSTs the writ to executor <code>/v1/writs/execute</code> with <code>X-Agent-ID</code>. Executor verifies, runs, signs evidence.</p></div>
   </div>
+
+  <p>Completed decisions, including Council and OPA denials, omit <code>retryable</code>.
+    Temporary overload errors include <code>retryable: true</code> and guidance to wait before
+    retrying the same authorization request. After a denial, follow the returned guidance
+    to consider a safer revised operation; every revision requires independent
+    authorization. See
+    <a href="../agent-denial-recovery.md">agent recovery after a denial</a> for the contract
+    and the Hermes pilot example.</p>
 
   <div class="section-head">
     <h2>Pick your path</h2>
@@ -292,7 +293,10 @@ AGENT_TOKEN       = os.environ[<span class="str">"NOMOS_AUTH_TOKEN"</span>]
 MCP_PROXY_TOKEN   = os.environ[<span class="str">"MONITOR_MCP_PROXY_TOKEN"</span>]
 
 <span class="kw">def</span> <span class="fn">_mcp</span>(client, name, **arguments):
-    <span class="cm">"""One MCP tools/call. Returns the unwrapped `data` payload."""</span>
+    <span class="cm">"""One MCP tools/call. Returns the tool's result object.
+
+    The council's tool results are FLAT -- there is no success/data envelope.
+    council_authorize returns status/writ/writ_id/guidance/error directly."""</span>
     r = client.post(COUNCIL_URL,
         headers={<span class="str">"Authorization"</span>: <span class="str">f"Bearer {MCP_PROXY_TOKEN}"</span>,
                  <span class="str">"X-Council-Source"</span>: <span class="str">"my-agent"</span>},
@@ -300,24 +304,23 @@ MCP_PROXY_TOKEN   = os.environ[<span class="str">"MONITOR_MCP_PROXY_TOKEN"</span
               <span class="str">"method"</span>: <span class="str">"tools/call"</span>,
               <span class="str">"params"</span>: {<span class="str">"name"</span>: name,
                          <span class="str">"arguments"</span>: {<span class="str">"auth_token"</span>: AGENT_TOKEN, **arguments}}},
-        timeout=30)
+        <span class="cm"># Above the monitor proxy deadline (180s), which is itself above the</span>
+        <span class="cm"># council retry budget (150s). At the default 30s this client hangs up</span>
+        <span class="cm"># before a healthy council answers -- measured responses reach 47s.</span>
+        timeout=240)
     r.raise_for_status()
     parsed = json.loads(r.json()[<span class="str">"result"</span>][<span class="str">"content"</span>][0][<span class="str">"text"</span>])
-    <span class="kw">if not</span> parsed[<span class="str">"success"</span>]:
+    <span class="kw">if</span> parsed.get(<span class="str">"status"</span>) == <span class="str">"error"</span> <span class="kw">or</span> parsed.get(<span class="str">"error"</span>):
         <span class="kw">raise</span> RuntimeError(parsed.get(<span class="str">"error"</span>) <span class="kw">or</span> <span class="str">"tool failed"</span>)
-    <span class="kw">return</span> parsed[<span class="str">"data"</span>]
+    <span class="kw">return</span> parsed
 
-<span class="kw">def</span> <span class="fn">propose</span>(client, **kw):
-    <span class="kw">return</span> _mcp(client, <span class="str">"propose_intent"</span>, agent_id=AGENT_ID, **kw)[<span class="str">"intent_id"</span>]
-
-<span class="kw">def</span> <span class="fn">wait_for_approval</span>(client, intent_id, deadline=60):
-    started = time.monotonic()
-    <span class="kw">while True</span>:
-        s = _mcp(client, <span class="str">"check_proposal_status"</span>, intent_id=intent_id)
-        <span class="kw">if</span> s[<span class="str">"state"</span>] <span class="kw">in</span> {<span class="str">"approved"</span>, <span class="str">"denied"</span>}: <span class="kw">return</span> s
-        <span class="kw">if</span> time.monotonic() - started > deadline:
-            <span class="kw">raise</span> TimeoutError(<span class="str">f"still {s['state']}"</span>)
-        time.sleep(1.0)
+<span class="cm"># One blocking call: the council evaluates the intent AND returns the signed</span>
+<span class="cm"># writ for that same evaluation. Do not pair it with council_propose_intent +</span>
+<span class="cm"># council_check_status -- council_authorize creates a NEW intent, so a client</span>
+<span class="cm"># that polls one intent and then authorizes would execute a decision it never</span>
+<span class="cm"># inspected. There is no separate writ-fetch tool.</span>
+<span class="kw">def</span> <span class="fn">authorize</span>(client, **kw):
+    <span class="kw">return</span> _mcp(client, <span class="str">"council_authorize"</span>, agent_id=AGENT_ID, **kw)
 
 <span class="kw">def</span> <span class="fn">run_writ</span>(client, writ_blob):
     r = client.post(<span class="str">f"{EXECUTOR_URL}/v1/writs/execute"</span>,
@@ -329,7 +332,7 @@ MCP_PROXY_TOKEN   = os.environ[<span class="str">"MONITOR_MCP_PROXY_TOKEN"</span
 
 <span class="kw">def</span> <span class="fn">main</span>():
     <span class="kw">with</span> httpx.Client() <span class="kw">as</span> client:
-        intent_id = propose(client,
+        auth = authorize(client,
             description=<span class="str">"Read the README"</span>,
             target_resource=<span class="str">"/workspace/README.md"</span>,
             justification=<span class="str">"Map repo before opening a PR"</span>,
@@ -337,11 +340,12 @@ MCP_PROXY_TOKEN   = os.environ[<span class="str">"MONITOR_MCP_PROXY_TOKEN"</span
             working_directory=<span class="str">"/workspace"</span>,
             blast_radius=<span class="str">"Read-only"</span>,
             target_environment=<span class="str">"development"</span>)
-        status = wait_for_approval(client, intent_id)
-        <span class="kw">if</span> status[<span class="str">"state"</span>] == <span class="str">"denied"</span>:
-            <span class="kw">return</span> print(<span class="str">"denied:"</span>, status.get(<span class="str">"evaluation"</span>))
+        <span class="kw">if</span> auth[<span class="str">"status"</span>] != <span class="str">"approved"</span>:
+            <span class="kw">return</span> print(<span class="str">"denied:"</span>, auth.get(<span class="str">"guidance"</span>) <span class="kw">or</span> auth.get(<span class="str">"error"</span>))
 
-        writ_blob = _mcp(client, <span class="str">"get_writ"</span>, intent_id=intent_id)[<span class="str">"writ_blob"</span>]
+        <span class="cm"># The writ belongs to the evaluation just returned, so what runs below</span>
+        <span class="cm"># is the decision that was actually inspected above.</span>
+        writ_blob = auth[<span class="str">"writ"</span>]
         result    = run_writ(client, writ_blob)
 
         ev = ExecutionEvidence(**result[<span class="str">"evidence"</span>])
@@ -550,23 +554,22 @@ curl -s https://my-exec.example.com\
         <h3>C.1 — The mixed flow</h3>
         <p>You run the shipped council unmodified. Your executors are custom because actions translate to managed-service calls. The agent:</p>
         <ul>
-          <li>Calls <code>propose_intent</code> on the council (Part A).</li>
-          <li>Polls <code>check_proposal_status</code> until <code>approved</code>.</li>
-          <li>Calls <code>get_writ</code> to retrieve the signed blob — <em>does not</em> call <code>execute_intent</code>.</li>
+          <li>Calls <code>council_propose_intent</code> first if it wants the decision without committing (Part A).</li>
+          <li>Calls <code>council_authorize</code> when committed: one blocking call evaluates the intent and, on approval, returns the signed blob in the <code>writ</code> field. There is no separate approve or fetch step to poll for.</li>
           <li>POSTs <code>{"writ": writ_blob, …}</code> to your executor's <code>/v1/writs/execute</code>.</li>
           <li>Verifies the executor's evidence signature.</li>
         </ul>
       </div>
       <div class="card">
-        <h3>C.2 — Why not execute_intent?</h3>
-        <p><code>execute_intent</code> assumes the council is responsible for running the writ — a pattern that fits co-located executors only. In the mixed case, the agent is the broker: it owns the decision of which executor instance receives the writ.</p>
+        <h3>C.2 — The council never runs the writ</h3>
+        <p>No council tool executes anything: the deployed catalog is 18 <code>council_*</code> tools that evaluate, mint, and read the ledger. The agent is always the broker — it owns the decision of which executor instance receives the writ.</p>
         <p>This is also how routing multi-region / per-tenant works. The same council can serve writs that one agent dispatches to <code>exec-eu</code> and another agent dispatches to <code>exec-us</code>.</p>
       </div>
     </div>
 
     <div class="card" style="margin-bottom:20px">
-      <h3>C.3 — Recommended addition: report evidence</h3>
-      <p>The shipped council records outcomes only when it ran <code>execute_intent</code> itself. In the mixed case, nobody updates the ledger automatically. After execution, have the agent call back to the council with a <code>report_evidence(intent_id, evidence_blob)</code> tool so the audit log stays complete. The exact tool name varies by version — check <code>nomos/mcp/tools.py</code> against your deployed council.</p>
+      <h3>C.3 — Report the outcome yourself</h3>
+      <p>There is no council tool for reporting an outcome back. The bundled executors write it to the shared Redis themselves, as a hash at <code>nomos:writs:{writ_id}:outcome</code> (exit code, stdout hash, timestamps) — best-effort, and never blocking the response. A custom executor that shares that Redis should do the same. If it cannot, the agent can instead carry the executor's signed <code>ExecutionResult</code> into the next request's <code>certified_evidence</code> field, where the council verifies the signature against the registered executor before the members see it.</p>
     </div>
   </div>
 
@@ -590,7 +593,7 @@ curl -s https://my-exec.example.com\
   <div class="checkrow">
     <div class="dot"></div>
     <div><h5>1. Authentication works</h5>
-      <p><code>curl -s -H "Authorization: Bearer $MCP" $COUNCIL/debug/tools/list</code> returns the tool catalog. 401 = wrong proxy token.</p></div>
+      <p><code>curl -s $COUNCIL/debug/tools/list</code> returns the tool catalog. This endpoint is unauthenticated — it confirms the council is reachable and answering, not that your proxy token is correct. A wrong token shows up as a <code>401</code> on the first <code>/mcp</code> call in step 2.</p></div>
   </div>
   <div class="checkrow">
     <div class="dot"></div>
@@ -672,7 +675,7 @@ curl -s https://my-exec.example.com\
     line(XC,265,XC+90,295,{c:'cfg',label:'2 · OPA · vote · sign',op:.7});
     line(XC+90,295,XC,325,{c:'cfg'});
     // 3. fetch writ
-    line(XC,355,XA,355,{c:'app',label:'3 · get_writ',sub:'writ_blob (base64)'});
+    line(XC,355,XA,355,{c:'app',label:'3 · council_authorize',sub:'writ (base64)'});
     // 4. submit + run
     line(XA,420,XE,420,{c:'sec',label:'4 · POST /v1/writs/execute',sub:'X-Agent-ID'});
     line(XE,450,XE+60,480,{c:'sec',op:.6});
@@ -686,26 +689,40 @@ curl -s https://my-exec.example.com\
     stage.style.transform='scale('+s+')';
     wrap.style.height=(620*s)+'px';
   }
+  function selectPart(event){
+    var selected=event.currentTarget;
+    var p=selected.dataset.part;
+    document.querySelectorAll('.part').forEach(function(x){x.classList.toggle('on',x===selected);});
+    document.querySelectorAll('.partpane').forEach(function(x){x.classList.toggle('on',x.dataset.part===p);});
+  }
+  function navigateTab(){var h=this.dataset.href;if(h){location.href=h;}}
+  var copyResetTimers=new WeakMap();
+  function resetCopyButton(btn){
+    btn.textContent='copy';btn.classList.remove('ok');
+    copyResetTimers.delete(btn);
+  }
+  function showCopySuccess(btn){
+    var resetTimer=copyResetTimers.get(btn);
+    if(resetTimer){clearTimeout(resetTimer);}
+    btn.textContent='copied';btn.classList.add('ok');
+    copyResetTimers.set(btn,setTimeout(resetCopyButton,1200,btn));
+  }
+  function copyCode(event){
+    var btn=event.currentTarget;
+    if(!navigator.clipboard||typeof navigator.clipboard.writeText!=='function'){return;}
+    var code=Array.prototype.map.call(btn.parentElement.childNodes,function(node){
+      return node===btn?'':node.textContent;
+    }).join('').trim();
+    navigator.clipboard.writeText(code).then(function(){showCopySuccess(btn);},function(){});
+  }
   document.querySelectorAll('.part').forEach(function(b){
-    b.addEventListener('click',function(){
-      var p=b.getAttribute('data-part');
-      document.querySelectorAll('.part').forEach(function(x){x.classList.toggle('on',x===b);});
-      document.querySelectorAll('.partpane').forEach(function(x){x.classList.toggle('on',x.getAttribute('data-part')===p);});
-    });
+    b.addEventListener('click',selectPart);
   });
   document.querySelectorAll('.tab').forEach(function(t){
-    t.addEventListener('click',function(){
-      var h=t.getAttribute('data-href');if(h){location.href=h;}
-    });
+    t.addEventListener('click',navigateTab);
   });
   document.querySelectorAll('[data-copy]').forEach(function(btn){
-    btn.addEventListener('click',function(){
-      var code=btn.parentElement.innerText.replace(/^copy\n?/,'').trim();
-      navigator.clipboard.writeText(code).then(function(){
-        btn.textContent='copied';btn.classList.add('ok');
-        setTimeout(function(){btn.textContent='copy';btn.classList.remove('ok');},1200);
-      });
-    });
+    btn.addEventListener('click',copyCode);
   });
   function go(){fit();build();}
   if(document.fonts&&document.fonts.ready){document.fonts.ready.then(go);}

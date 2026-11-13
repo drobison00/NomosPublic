@@ -1,13 +1,6 @@
 <!--
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-
-NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-property and proprietary rights in and to this material, related
-documentation and any modifications thereto. Any use, reproduction,
-disclosure or distribution of this material and related documentation
-without an express license agreement from NVIDIA CORPORATION or
-its affiliates is strictly prohibited.
+SPDX-License-Identifier: Apache-2.0
 -->
 
 <!doctype html>
@@ -774,8 +767,11 @@ evidence = { payload, public_key_hex, key_fingerprint, signature }</pre>
                 <div class="tab-panel" id="tab-registry">
                   <div class="field-grid">
                     <div class="field">
-                      <code>trusted_executor:{fingerprint}</code>
-                      <span>Redis lookup by the evidence key fingerprint.</span>
+                      <code>nomos:trusted_executors:{fingerprint}</code>
+                      <span>Lookup by the evidence key fingerprint. This is the Redis
+                      form; in service mode (the Kind default) the same record is a row
+                      in the <code>trusted_executors</code> table, keyed by
+                      <code>key_fingerprint</code>.</span>
                     </div>
                     <div class="field">
                       <code>enabled == "1"</code>

@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 # ─────────────────────────────────────────────────────────────
 # Nomos — Docker Compose Stack
@@ -175,6 +167,10 @@ services:
       - council-public-keys:/app/public-keys
       - council-ledger:/app/ledger
       - ./dynamic-config:/app/dynamic-config
+    # The bootstrap persists this host group in deploy/.env. Use a dedicated
+    # group on shared hosts; its members can modify council configuration.
+    group_add:
+      - "${COUNCIL_CONFIG_GID:-1000}"
     networks:
       - nomos-net
       - opa-net
@@ -305,8 +301,10 @@ services:
       - "${DEMO_PORT:-8000}:8000"
     environment:
       # Route through the monitor so demo traffic shows up in unified stats.
-      # The demo's CouncilClient sets X-Council-Source: demo.
+      # The demo's CouncilClient sets X-Council-Source: demo and authenticates
+      # to the monitor with the same bearer token the monitor validates.
       - NOMOS_COUNCIL_URL=http://monitor:9901/mcp
+      - MONITOR_MCP_PROXY_TOKEN=${MONITOR_MCP_PROXY_TOKEN:-}
       - NOMOS_EXECUTOR_URL=${NOMOS_EXECUTOR_URL:-http://executor-openshell:9906}
       - NOMOS_WORKSPACE=/workspace
       - DEMO_AUTH_USER=${DEMO_AUTH_USER:-demo}

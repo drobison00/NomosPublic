@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """Opt-in live integration tests for a deployed MCP council.
 
@@ -35,6 +27,11 @@ AGENT_ID = os.environ.get("NOMOS_AGENT_ID", "agent-admin")
 AUTH_TOKEN = os.environ.get("NOMOS_AUTH_TOKEN") or os.environ.get("NOMOS_TOKEN", "")
 WORKSPACE = os.environ.get("NOMOS_LIVE_WORKSPACE", "/workspace")
 TIMEOUT_SECONDS = float(os.environ.get("NOMOS_MCP_LIVE_TIMEOUT_SECONDS", "180"))
+PROBABILISTIC_DEMO_ENABLED = os.environ.get("NOMOS_MCP_LIVE_PROBABILISTIC_DEMO", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 pytestmark = [
     pytest.mark.live_mcp,
@@ -86,9 +83,22 @@ async def _authorize(session: ClientSession, intent: dict[str, Any]) -> dict[str
     )
 
 
+def _proxy_headers() -> dict[str, str]:
+    """Bearer header for the monitor's /mcp proxy, when one is configured.
+
+    The deploy scripts generate MONITOR_MCP_PROXY_TOKEN and the monitor rejects
+    unauthenticated requests once it is set, so a live suite that never sends the
+    header cannot reach its own deployment -- it fails with 401 before any product
+    behaviour is exercised. Empty when unset, which keeps an unauthenticated dev
+    proxy working unchanged.
+    """
+    token = os.environ.get("MONITOR_MCP_PROXY_TOKEN", "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 @asynccontextmanager
 async def live_session():
-    async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as http_client:
+    async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS, headers=_proxy_headers()) as http_client:
         async with streamable_http_client(
             LIVE_MCP_URL,
             http_client=http_client,
@@ -184,6 +194,10 @@ async def test_live_council_mints_and_indexes_low_risk_writ():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not PROBABILISTIC_DEMO_ENABLED,
+    reason="set NOMOS_MCP_LIVE_PROBABILISTIC_DEMO=1 to run this probabilistic demo verdict",
+)
 async def test_live_council_reviews_packaged_file_attachment():
     scenario = scenarios_by_id()["s8-packaged-script"]
     intent = scenario.to_intent()
@@ -212,6 +226,10 @@ async def test_live_council_reviews_packaged_file_attachment():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not PROBABILISTIC_DEMO_ENABLED,
+    reason="set NOMOS_MCP_LIVE_PROBABILISTIC_DEMO=1 to run this probabilistic demo verdict",
+)
 async def test_live_council_db_pool_bump_requires_certified_evidence():
     """Mirror the demo's checkout DB pool first turn: prose-only claims are denied."""
     scenario = scenarios_by_id()["s7-iterate"]

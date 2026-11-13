@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """
 NAT function registrations for the Nomos council.
@@ -24,10 +16,19 @@ import os
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, ClassVar, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 from nomos.auth.authenticator import AgentAuthenticator, AgentIdentity
 from nomos.auth.permissions import categorize_intent
@@ -39,7 +40,7 @@ from nomos.crypto.signer_provider import (
     SignerProvider,
     VaultTransitSigner,
 )
-from nomos.level_0.types import AgentRole, CouncilMember, Intent
+from nomos.level_0.types import AgentRole, CouncilMember, Intent, ToolCallRequest
 from nomos.level_0.types.intent import (
     INTENT_BLAST_RADIUS_MAX_LENGTH,
     INTENT_CONTEXT_MAX_LENGTH,
@@ -49,8 +50,14 @@ from nomos.level_0.types.intent import (
 from nomos.level_0.types.packaged_file import PackagedFile
 from nomos.level_0.types.writ import VoteSummary
 from nomos.level_1.ledger import FileLedgerStorage, LedgerChain, LedgerEntryType
+from nomos.level_1.policy import DecisionType
 from nomos.level_2.quorum import VoteType
-from nomos.level_4.council import CouncilConfig, SecurityCouncil
+from nomos.level_4.council import (
+    CouncilConfig,
+    IntentSubmissionPreflight,
+    PreflightResult,
+    SecurityCouncil,
+)
 from nomos.level_4.council.workflow import WorkflowState
 from nomos.llm.base import LLMBackend
 from nomos.llm.council_agent import (
@@ -76,6 +83,7 @@ from nomos.opa import (
 from nomos.store.base import DurableStore
 from nomos.store.postgres_store import PostgresStore
 from nomos.store.redis_store import RedisStore
+from nomos.strict_json import DuplicateSafeJsonModel
 from trusted_executor_contract import ExecutionEvidence, ExecutionResult
 
 logger = logging.getLogger(__name__)
@@ -88,6 +96,17 @@ SUPPORTED_API_VERSIONS = {API_VERSION_V1, API_VERSION_V2}
 # request input, so it is clamped to this bound before being used as a loop
 # limit to prevent an unbounded loop on hostile input (sonar S6680).
 _MAX_DEBATE_ROUNDS = 25
+
+_TaskResultT = TypeVar("_TaskResultT")
+
+
+@dataclass(frozen=True)
+class PendingMemberEvaluation:
+    """A member inference result that has not mutated council state."""
+
+    agent: CouncilMemberAgent
+    evaluation: IntentEvaluation
+    duration_ms: float
 
 
 def _elapsed_ms(start: float) -> float:
@@ -308,7 +327,28 @@ class DebateRound(BaseModel):
     )
 
 
-class ProposeIntentOutput(BaseModel):
+class _LoadSheddingOutput(BaseModel):
+    """Keep the Python default while publishing only an affirmative retry hint."""
+
+    retryable: bool = Field(
+        default=False,
+        description=(
+            "True when temporary load shedding allows retrying the unchanged request. "
+            "Otherwise omitted from serialized responses; absence is not authorization."
+        ),
+    )
+
+    @model_serializer(mode="wrap")
+    def serialize_retry_hint(self, handler: SerializerFunctionWrapHandler):
+        # No return annotation: preserve the model's field-level JSON schema
+        # instead of replacing it with an unstructured dict serialization schema.
+        data: dict[str, Any] = handler(self)
+        if not self.retryable:
+            data.pop("retryable", None)
+        return data
+
+
+class ProposeIntentOutput(_LoadSheddingOutput):
     """Output schema for propose_intent."""
 
     api_version: str = API_VERSION_V1
@@ -318,10 +358,6 @@ class ProposeIntentOutput(BaseModel):
     state: str = ""
     requires_approval: bool = False
     error: str = ""
-    retryable: bool = Field(
-        default=False,
-        description="True when the request was shed due to load and may be retried",
-    )
     council_members: list[MemberVote] = Field(
         default_factory=list, description="Final member votes (after all debate rounds)"
     )
@@ -433,10 +469,41 @@ class PublicKeyOutput(BaseModel):
     error: str = ""
 
 
-class AuthorizeInput(BaseModel):
+class AuthorizeInput(DuplicateSafeJsonModel):
     """Input for council_authorize: authenticate → evaluate → mint writ."""
 
-    api_version: str = Field(default=API_VERSION_V1, description="Council API version")
+    model_config: ClassVar[ConfigDict] = {
+        "json_schema_extra": {
+            "oneOf": [
+                {
+                    "required": ["command", "working_directory"],
+                    "properties": {
+                        "command": {"minLength": 1},
+                        "working_directory": {"minLength": 1},
+                        "tool_call": {"type": "null"},
+                    },
+                },
+                {
+                    "required": ["tool_call"],
+                    "properties": {
+                        "tool_call": {"type": "object"},
+                        "api_version": {"const": "v2"},
+                        "command": {"const": ""},
+                        "working_directory": {"const": ""},
+                        "env": {"maxProperties": 0},
+                        "packaged_files": {"maxItems": 0},
+                    },
+                },
+            ]
+        }
+    }
+
+    # Empty, not v1: NAT's MCP wrapper passes every omitted field's default
+    # explicitly, so a v1 default would be indistinguishable from a caller's v1.
+    api_version: str = Field(
+        default="",
+        description="Council API version. Omitted: v2 with tool_call, otherwise v1.",
+    )
     auth_token: str = Field(default="", description="Agent authentication token")
     agent_id: str = Field(..., description="ID of the requesting agent")
     council_id: str = Field(
@@ -445,9 +512,13 @@ class AuthorizeInput(BaseModel):
             "Council to petition. Optional on v1 compatibility tools; required on v2 tools."
         ),
     )
-    command: str = Field(..., min_length=1, description="Exact command to authorize")
+    command: str = Field(default="", description="Exact shell command to authorize")
     working_directory: str = Field(
-        ..., min_length=1, description="Directory where the command will run (required)"
+        default="", description="Directory where a shell command will run"
+    )
+    tool_call: ToolCallRequest | None = Field(
+        default=None,
+        description="Structured application tool call to authorize",
     )
     env: dict[str, str] = Field(
         default_factory=dict, description="Environment variables for execution"
@@ -477,8 +548,43 @@ class AuthorizeInput(BaseModel):
         description="Files to review and package into the execution writ",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def infer_structured_api_version(cls, value: object) -> object:
+        """Select v2 when the request carries the structured discriminator, else v1."""
 
-class AuthorizeOutput(BaseModel):
+        if isinstance(value, dict) and not value.get("api_version"):
+            value = dict(value)
+            structured = value.get("tool_call") is not None
+            value["api_version"] = API_VERSION_V2 if structured else API_VERSION_V1
+        return value
+
+    @model_validator(mode="after")
+    def validate_operation_shape(self) -> "AuthorizeInput":
+        """Require exactly one of the shell and structured operation shapes."""
+
+        if self.tool_call is None:
+            if not self.command or not self.working_directory:
+                raise ValueError("shell authorization requires command and working_directory")
+            return self
+        if self.api_version != API_VERSION_V2:
+            raise ValueError("structured tool-call authorization uses api_version v2")
+        if self.command or self.working_directory or self.env or self.packaged_files:
+            raise ValueError(
+                "structured tool-call authorization cannot include shell execution "
+                "or packaged-file fields"
+            )
+        return self
+
+
+_DENIAL_RETRY_GUIDANCE = (
+    "Safer revisions within the user's authorized goal require fresh authorization. "
+    "Do not invent permissions or justification, or repeat unchanged policy-denied requests. "
+    "If no compliant alternative exists, stop and ask for clarification."
+)
+
+
+class AuthorizeOutput(_LoadSheddingOutput):
     """Output for council_authorize."""
 
     api_version: str = API_VERSION_V1
@@ -491,10 +597,6 @@ class AuthorizeOutput(BaseModel):
     decision_id: str = Field(default="", description="Intent/decision ID")
     guidance: list[str] = Field(default_factory=list, description="Guidance from council on denial")
     error: str = Field(default="", description="Error message if status is 'error'")
-    retryable: bool = Field(
-        default=False,
-        description="True when the request was shed due to load and may be retried",
-    )
     council_members: list[MemberVote] = Field(default_factory=list, description="Member votes")
     chairman: ChairmanInfo | None = Field(default=None, description="Chairman decision")
     code_review: MemberVote | None = Field(
@@ -508,6 +610,18 @@ class AuthorizeOutput(BaseModel):
         default_factory=list,
         description="Per-round vote snapshots: index 0 = initial votes, 1+ = debate rounds",
     )
+
+    @model_validator(mode="after")
+    def clarify_denial_retry_semantics(self) -> "AuthorizeOutput":
+        # Existing agents render guidance, not necessarily the output schema.
+        # Put the protocol note first so bounded renderers retain it, without
+        # replacing member/OPA advice or changing the authorization decision.
+        if self.status == "denied":
+            self.guidance = [
+                _DENIAL_RETRY_GUIDANCE,
+                *[item for item in self.guidance if item != _DENIAL_RETRY_GUIDANCE],
+            ]
+        return self
 
 
 class WritStatusInput(BaseModel):
@@ -611,6 +725,58 @@ RequestEvidenceInputT = TypeVar(
 # ── Council Service (holds state, used by NAT functions) ────────────────
 
 
+def build_denial_guidance(votes: list[MemberVote]) -> list[str]:
+    """Assemble the guidance returned with a denial.
+
+    Lives here, and is called by `authorize`, so that a test can exercise the
+    real thing. It was previously inline, and the regression test kept its own
+    copy of the same logic -- so a change here would not have failed that test.
+
+    A denial with no guidance and no error tells the caller nothing: they are
+    refused and given nothing to act on. That happens when every denying member
+    failed to evaluate rather than objecting -- a member that times out produces
+    no guidance, so the list is empty. Say so explicitly, and name it as an
+    infrastructure failure rather than a judgement about the request, because
+    the remedy is completely different.
+    """
+    parts = [v.guidance for v in votes if v.guidance]
+    if parts:
+        return parts
+
+    denials = [v for v in votes if v.decision == "deny"]
+    unevaluated = [
+        v for v in denials if any("evaluation failure" in c.lower() for c in v.risk_concerns)
+    ]
+    if not unevaluated:
+        return parts
+
+    names = ", ".join(v.member_id for v in unevaluated if v.member_id) or "a council member"
+    detail = "; ".join(v.reasoning for v in unevaluated if v.reasoning)
+
+    # Only claim the denial is purely infrastructural when EVERY denying member
+    # failed to evaluate. A member can deny on the merits and still leave
+    # `guidance` empty, and in that mixed case telling the caller it was "not
+    # because of anything in the request" sends them to check model availability
+    # when the request is in fact the problem.
+    if len(unevaluated) == len(denials):
+        return [
+            f"Denied because {names} could not be evaluated, not because of "
+            "anything in the request. The council fails closed when a member is "
+            "unreachable. Retry; if it persists, check the configured model's "
+            f"availability and request_timeout_seconds. Member detail: {detail}"
+        ]
+
+    substantive = [v for v in denials if v not in unevaluated]
+    others = ", ".join(v.member_id for v in substantive if v.member_id) or "another member"
+    reasons = "; ".join(v.reasoning for v in substantive if v.reasoning)
+    return [
+        f"Denied for two different reasons. {names} could not be evaluated "
+        f"(infrastructure, not your request): {detail}. Separately, {others} "
+        f"denied on the merits{': ' + reasons if reasons else ''}. Address the "
+        "substantive objection; retrying alone will not clear this."
+    ]
+
+
 class CouncilService:
     """
     Manages the SecurityCouncil instance and LLM-backed council members.
@@ -653,7 +819,7 @@ class CouncilService:
         signer = self._active_signer()
         ledger = self._build_ledger(signer)
         # _build_ledger sets self._ledger_pool as a side effect in postgres mode;
-        # reuse that pool for the replica-shared workflow status cache (NOMOS-5b).
+        # reuse that pool for the replica-shared workflow status cache.
         self._workflow_store = self._build_workflow_store()
 
         self._council = SecurityCouncil(
@@ -727,7 +893,7 @@ class CouncilService:
         )
 
     def _build_workflow_store(self):
-        """Build the replica-shared workflow status cache (NOMOS-5b), if any.
+        """Build the replica-shared workflow status cache, if any.
 
         Returns ``None`` outside postgres mode (file/redis dev mode keeps the
         council's in-memory-only behavior). Reuses the synchronous ledger pool
@@ -1321,6 +1487,25 @@ class CouncilService:
     @staticmethod
     def _build_authorize_intent_kwargs(input_data: AuthorizeInput, agent_id: str) -> dict[str, Any]:
         """Translate authorize input into Intent.create kwargs."""
+        if input_data.tool_call is not None:
+            operation = input_data.tool_call.to_operation()
+            structured_kwargs: dict[str, Any] = {
+                "agent_id": agent_id,
+                "council_id": input_data.council_id,
+                "description": input_data.description
+                or f"Authorize structured tool call: {operation.tool_name}",
+                "target_resource": input_data.target_resource or operation.tool_name,
+                "command": "",
+                "command_type": "api",
+                "operation": operation.model_dump(mode="json"),
+                "justification": input_data.justification,
+                "blast_radius": input_data.blast_radius,
+                "context": input_data.context,
+            }
+            if input_data.evidence:
+                structured_kwargs["evidence"] = input_data.evidence
+            return structured_kwargs
+
         description = input_data.description or f"Execute: {input_data.command[:80]}"
         if len(description) < 10:
             # Pad to the 10-char minimum without deriving a repeat count from
@@ -1381,6 +1566,359 @@ class CouncilService:
             review
         )
 
+    async def _preflight_intent(self, intent: Intent) -> PreflightResult:
+        """Serialize policy preflight and pending-slot reservation."""
+        async with self._submit_lock:
+            preflight_task = asyncio.create_task(
+                asyncio.to_thread(self._council.preflight_intent, intent)
+            )
+            result, cancelled = await self._shield_and_drain(preflight_task)
+            if cancelled:
+                if result.preflight is not None:
+                    self._council.release_preflight(result.preflight)
+                raise asyncio.CancelledError
+            return result
+
+    @staticmethod
+    async def _shield_and_drain(
+        task: asyncio.Task[_TaskResultT],
+    ) -> tuple[_TaskResultT, bool]:
+        """Wait for critical work to finish despite repeated caller cancellation."""
+        cancelled = False
+        while True:
+            try:
+                return await asyncio.shield(task), cancelled
+            except asyncio.CancelledError:
+                cancelled = True
+                if task.done():
+                    return task.result(), cancelled
+
+    async def _release_preflight_safely(
+        self,
+        preflight: IntentSubmissionPreflight,
+    ) -> None:
+        """Release a reservation even while the caller is being cancelled."""
+
+        async def _release() -> None:
+            async with self._submit_lock:
+                await asyncio.to_thread(self._council.release_preflight, preflight)
+
+        _, cancelled = await self._shield_and_drain(asyncio.create_task(_release()))
+        if cancelled:
+            raise asyncio.CancelledError
+
+    @staticmethod
+    def _stage_interval(
+        *,
+        name: str,
+        start: float,
+        total_start: float,
+        duration_ms: float,
+        overlap_group: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        interval: dict[str, Any] = {
+            "name": name,
+            "start_offset_ms": round((start - total_start) * 1000, 1),
+            "duration_ms": round(duration_ms, 1),
+        }
+        if overlap_group is not None:
+            interval["overlap_group"] = overlap_group
+        if status is not None:
+            interval["status"] = status
+        return interval
+
+    @staticmethod
+    def _review_timing(
+        stages: dict[str, float],
+        actors: list[dict[str, Any]],
+        stage_intervals: list[dict[str, Any]],
+        timing_model: str | None,
+    ) -> dict[str, Any]:
+        timing: dict[str, Any] = {
+            "stages_ms": dict(stages),
+            "actors": list(actors),
+        }
+        if stage_intervals:
+            timing["stage_intervals"] = list(stage_intervals)
+        if timing_model is not None:
+            timing["timing_model"] = timing_model
+        return timing
+
+    async def _run_parallel_initial_calls(
+        self,
+        intent: Intent,
+        chairman_call: Callable[[], Awaitable[Any]],
+        chairman_authorizes: Callable[[Any], bool],
+        *,
+        total_start: float,
+        stages: dict[str, float],
+        stage_intervals: list[dict[str, Any]],
+        actors: list[dict[str, Any]],
+    ) -> tuple[Any, list[PendingMemberEvaluation] | None]:
+        """Run chairman and member inference together with explicit sibling cleanup."""
+        parallel_start = time.perf_counter()
+
+        async def _chairman() -> tuple[Any, float]:
+            started = time.perf_counter()
+            try:
+                result = await chairman_call()
+            except asyncio.CancelledError:
+                duration_ms = _elapsed_ms(started)
+                actors.append(
+                    self._actor_latency(
+                        role="chairman",
+                        member_id="chairman",
+                        provider=self._chairman.provider_name if self._chairman else "",
+                        duration_ms=duration_ms,
+                        status="cancelled",
+                    )
+                )
+                raise
+            except Exception:
+                duration_ms = _elapsed_ms(started)
+                actors.append(
+                    self._actor_latency(
+                        role="chairman",
+                        member_id="chairman",
+                        provider=self._chairman.provider_name if self._chairman else "",
+                        duration_ms=duration_ms,
+                        decision="error",
+                        status="error",
+                    )
+                )
+                raise
+
+            duration_ms = _elapsed_ms(started)
+            actors.append(
+                self._actor_latency(
+                    role="chairman",
+                    member_id="chairman",
+                    provider=self._chairman.provider_name if self._chairman else "",
+                    duration_ms=duration_ms,
+                    decision=getattr(result, "threshold", "") or "denied",
+                    timing=getattr(result, "timing", None),
+                    status="completed",
+                )
+            )
+            return result, duration_ms
+
+        member_elapsed_ms: float | None = None
+
+        async def _members() -> tuple[list[PendingMemberEvaluation], float]:
+            nonlocal member_elapsed_ms
+            started = time.perf_counter()
+            try:
+                evaluations = await self._evaluate_agents(intent, actor_timings=actors)
+            finally:
+                member_elapsed_ms = _elapsed_ms(started)
+            return evaluations, member_elapsed_ms
+
+        chairman_task = asyncio.create_task(_chairman())
+        member_task = asyncio.create_task(_members())
+
+        async def _discard_or_cancel_members() -> tuple[float, str]:
+            if not member_task.done():
+                member_task.cancel()
+            member_outcome = (await asyncio.gather(member_task, return_exceptions=True))[0]
+            if isinstance(member_outcome, tuple):
+                _, completed_ms = member_outcome
+                return completed_ms, "discarded"
+            if isinstance(member_outcome, asyncio.CancelledError):
+                return member_elapsed_ms or _elapsed_ms(parallel_start), "cancelled"
+            return member_elapsed_ms or _elapsed_ms(parallel_start), "error"
+
+        try:
+            chairman_result, chairman_ms = await chairman_task
+            stages["chairman"] = chairman_ms
+            stage_intervals.append(
+                self._stage_interval(
+                    name="chairman",
+                    start=parallel_start,
+                    total_start=total_start,
+                    duration_ms=chairman_ms,
+                    overlap_group="initial_review",
+                    status="completed",
+                )
+            )
+
+            if not chairman_authorizes(chairman_result):
+                member_ms, member_status = await _discard_or_cancel_members()
+                stages["member_evaluation"] = member_ms
+                stage_intervals.append(
+                    self._stage_interval(
+                        name="member_evaluation",
+                        start=parallel_start,
+                        total_start=total_start,
+                        duration_ms=member_ms,
+                        overlap_group="initial_review",
+                        status=member_status,
+                    )
+                )
+                stages["parallel_review_wall"] = _elapsed_ms(parallel_start)
+                return chairman_result, None
+
+            evaluations, member_ms = await member_task
+            stages["member_evaluation"] = member_ms
+            stage_intervals.append(
+                self._stage_interval(
+                    name="member_evaluation",
+                    start=parallel_start,
+                    total_start=total_start,
+                    duration_ms=member_ms,
+                    overlap_group="initial_review",
+                    status="completed",
+                )
+            )
+            stages["parallel_review_wall"] = _elapsed_ms(parallel_start)
+            return chairman_result, evaluations
+        except asyncio.CancelledError:
+            chairman_task.cancel()
+            member_task.cancel()
+            await asyncio.gather(chairman_task, member_task, return_exceptions=True)
+            raise
+        except Exception:
+            member_ms, member_status = await _discard_or_cancel_members()
+            await asyncio.gather(chairman_task, return_exceptions=True)
+            wall_ms = _elapsed_ms(parallel_start)
+            if "chairman" not in stages:
+                chairman_ms = next(
+                    (
+                        float(actor["duration_ms"])
+                        for actor in reversed(actors)
+                        if actor.get("role") == "chairman"
+                    ),
+                    wall_ms,
+                )
+                stages["chairman"] = chairman_ms
+                stage_intervals.append(
+                    self._stage_interval(
+                        name="chairman",
+                        start=parallel_start,
+                        total_start=total_start,
+                        duration_ms=chairman_ms,
+                        overlap_group="initial_review",
+                        status="error",
+                    )
+                )
+            stages["member_evaluation"] = member_ms
+            stage_intervals.append(
+                self._stage_interval(
+                    name="member_evaluation",
+                    start=parallel_start,
+                    total_start=total_start,
+                    duration_ms=member_ms,
+                    overlap_group="initial_review",
+                    status=member_status,
+                )
+            )
+            stages["parallel_review_wall"] = wall_ms
+            raise
+
+    async def _commit_parallel_initial_review(
+        self,
+        intent: Intent,
+        preflight: IntentSubmissionPreflight,
+        evaluations: list[PendingMemberEvaluation],
+        *,
+        review_threshold: str | None,
+        enable_debate: bool,
+        request_type: str,
+    ) -> tuple[Any, list[MemberVote], Any | None, float, float, bool]:
+        """Consume a preflight and atomically record the buffered initial round."""
+
+        async def _commit() -> tuple[Any, list[MemberVote], Any | None, float, float]:
+            async with self._submit_lock:
+                submit_started = time.perf_counter()
+                result = await asyncio.to_thread(
+                    self._council.submit_intent,
+                    intent,
+                    review_threshold=review_threshold,
+                    preflight=preflight,
+                )
+                submit_ms = _elapsed_ms(submit_started)
+
+                votes: list[MemberVote] = []
+                workflow = result.workflow
+                tally_ms = 0.0
+                if result.success:
+                    tally_started = time.perf_counter()
+                    try:
+                        votes = self._record_agent_votes(intent, evaluations, finalize=False)
+                        workflow = self._council.finalize_intent_review(
+                            intent.intent_id,
+                            allow_pending=enable_debate and not self._all_agree(votes),
+                        ).workflow
+                    except BaseException as exc:
+                        # BaseException, not Exception: once submit_intent has
+                        # consumed the preflight, created the workflow and opened
+                        # the vote, every exit has to clean up. The callers'
+                        # preflight release is a no-op by this point, so anything
+                        # that skipped this would leave the partially voted
+                        # workflow non-terminal, holding an admission slot with no
+                        # decision.
+                        reason = f"initial review commit failed: {type(exc).__name__}"
+                        aborted = self._council.get_workflow(intent.intent_id)
+                        # Cleanup failures are logged, never raised: the caller
+                        # must see why the commit failed, not why the tidy-up
+                        # afterwards did. abort_intent_review terminalizes the
+                        # workflow in its own finally, so capacity is released
+                        # even when its audit append is what failed here.
+                        try:
+                            self._council.abort_intent_review(intent.intent_id, reason)
+                        except Exception:
+                            logger.exception(
+                                "Intent %s: aborting the failed review did not complete",
+                                intent.intent_id,
+                            )
+                        except BaseException:
+                            # Deliberately not swallowed. Discarding an interrupt to
+                            # re-raise the commit error would ignore an operator's
+                            # Ctrl-C and let the process carry on. The commit failure
+                            # is not lost either way: Python chains it as __context__
+                            # of whatever propagates. The workflow is still terminal,
+                            # because abort_intent_review does that in its own finally.
+                            logger.exception(
+                                "Intent %s: abort interrupted; commit failure is chained",
+                                intent.intent_id,
+                            )
+                            raise
+                        # The submission and any cast ballots are already on the
+                        # ledger (legacy mode) or awaiting the single consolidated
+                        # row (Tier-1b). Either way the review must not end without
+                        # a terminal record: abort_vote writes the legacy
+                        # DECISION_MADE, and this writes the consolidated one.
+                        try:
+                            self._record_consolidated_review(
+                                intent,
+                                request_type=request_type,
+                                final_state=WorkflowState.FAILED.value,
+                                decision="aborted",
+                                workflow=aborted,
+                                votes=votes,
+                                denial_reason=reason,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Intent %s: consolidated abort audit was not recorded",
+                                intent.intent_id,
+                            )
+                        except BaseException:
+                            # Same rule as above: an interrupt propagates rather than
+                            # being traded for the commit error, which stays chained.
+                            logger.exception(
+                                "Intent %s: abort audit interrupted; commit failure is chained",
+                                intent.intent_id,
+                            )
+                            raise
+                        raise
+                    tally_ms = _elapsed_ms(tally_started)
+
+                return result, votes, workflow, submit_ms, tally_ms
+
+        committed, cancelled = await self._shield_and_drain(asyncio.create_task(_commit()))
+        return (*committed, cancelled)
+
     async def _collect_review_outcome(
         self,
         intent: Intent,
@@ -1390,15 +1928,33 @@ class CouncilService:
         actor_timings: list[dict[str, Any]] | None = None,
     ) -> tuple[list[MemberVote], list[DebateRound], int, WorkflowState | None]:
         """Collect member votes and run any configured debate rounds."""
-        votes = await self._evaluate_with_agents(
-            intent,
-            finalize=False,
-            actor_timings=actor_timings,
-        )
+        evaluations = await self._evaluate_agents(intent, actor_timings=actor_timings)
+        votes = self._record_agent_votes(intent, evaluations, finalize=False)
         workflow = self._council.finalize_intent_review(
             intent.intent_id,
             allow_pending=enable_debate and not self._all_agree(votes),
         ).workflow
+
+        return await self._continue_review_outcome(
+            intent,
+            votes,
+            workflow,
+            enable_debate=enable_debate,
+            max_debate_rounds=max_debate_rounds,
+            actor_timings=actor_timings,
+        )
+
+    async def _continue_review_outcome(
+        self,
+        intent: Intent,
+        votes: list[MemberVote],
+        workflow: Any | None,
+        *,
+        enable_debate: bool,
+        max_debate_rounds: int,
+        actor_timings: list[dict[str, Any]] | None = None,
+    ) -> tuple[list[MemberVote], list[DebateRound], int, WorkflowState | None]:
+        """Continue from an already-recorded initial round into dependent debate rounds."""
 
         debate_history: list[DebateRound] = [DebateRound(round_number=0, votes=list(votes))]
         debate_rounds_completed = 0
@@ -1580,6 +2136,8 @@ class CouncilService:
         outcome: str,
         stages: dict[str, float],
         actors: list[dict[str, Any]],
+        stage_intervals: list[dict[str, Any]] | None = None,
+        timing_model: str | None = None,
     ) -> None:
         """Publish sanitized timing telemetry to the monitor side channel."""
         if not intent_id:
@@ -1587,17 +2145,20 @@ class CouncilService:
         total_ms = stages.get("total")
         if total_ms is not None:
             self._update_intent_latency_ewma(total_ms / 1000.0)
-        self._telemetry.publish_later(
-            {
-                "tool": tool,
-                "council_id": self.council_id,
-                "intent_id": intent_id,
-                "outcome": outcome,
-                "stages": {k: round(v, 1) for k, v in stages.items()},
-                "actors": actors,
-                "limiters": [limiter.gauge() for limiter in self._limiters],
-            }
-        )
+        payload: dict[str, Any] = {
+            "tool": tool,
+            "council_id": self.council_id,
+            "intent_id": intent_id,
+            "outcome": outcome,
+            "stages": {k: round(v, 1) for k, v in stages.items()},
+            "actors": actors,
+            "limiters": [limiter.gauge() for limiter in self._limiters],
+        }
+        if stage_intervals is not None:
+            payload["stage_intervals"] = stage_intervals
+        if timing_model is not None:
+            payload["timing_model"] = timing_model
+        self._telemetry.publish_later(payload)
 
     @staticmethod
     def _actor_latency(
@@ -1608,6 +2169,7 @@ class CouncilService:
         duration_ms: float,
         decision: str = "",
         timing: dict[str, float] | None = None,
+        status: str | None = None,
     ) -> dict[str, Any]:
         entry = {
             "role": role,
@@ -1617,9 +2179,17 @@ class CouncilService:
             "decision": decision,
         }
         if timing:
-            for key in ("queue_wait_ms", "inference_ms", "attempts"):
+            for key in (
+                "queue_wait_ms",
+                "inference_ms",
+                "attempts",
+                "input_tokens",
+                "output_tokens",
+            ):
                 if key in timing:
                     entry[key] = timing[key]
+        if status is not None:
+            entry["status"] = status
         return entry
 
     def _overload_rejection(self) -> tuple[str, list[str]] | None:
@@ -1670,7 +2240,12 @@ class CouncilService:
                 f"~{projected:.0f}s exceeds the latency threshold "
                 f"({threshold:.0f}s)"
             )
-            return error, [f"Retry after ~{max(1, round(limiter.estimated_wait_seconds()))}s"]
+            wait_seconds = max(1, round(limiter.estimated_wait_seconds()))
+            return error, [
+                "Authorization is temporarily unavailable. "
+                f"Wait approximately {wait_seconds} seconds, then retry the same "
+                "authorization request."
+            ]
         return None
 
     def get_ledger_page(self, input_data: LedgerPageInput) -> LedgerPageOutput:
@@ -1740,6 +2315,8 @@ class CouncilService:
         tool = "council_propose_intent"
         stages: dict[str, float] = {}
         actors: list[dict[str, Any]] = []
+        stage_intervals: list[dict[str, Any]] = []
+        timing_model: str | None = None
         total_start = time.perf_counter()
         stage_start = time.perf_counter()
         if input_data.api_version == API_VERSION_V2 and not input_data.council_id:
@@ -1853,14 +2430,6 @@ class CouncilService:
         )
         _stage(stages, tool, "opa", stage_start, intent_id=intent.intent_id)
         if opa_decision is not None and not opa_decision.allow:
-            _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
-            self._publish_latency(
-                tool=tool,
-                intent_id=intent.intent_id,
-                outcome="denied",
-                stages=stages,
-                actors=actors,
-            )
             self._record_consolidated_review(
                 intent,
                 request_type="propose",
@@ -1868,6 +2437,14 @@ class CouncilService:
                 decision="deny",
                 opa_decision=opa_decision,
                 denial_reason=self._opa_denial_error(opa_decision),
+            )
+            _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
+            self._publish_latency(
+                tool=tool,
+                intent_id=intent.intent_id,
+                outcome="denied",
+                stages=stages,
+                actors=actors,
             )
             return ProposeIntentOutput(
                 api_version=input_data.api_version,
@@ -1896,10 +2473,188 @@ class CouncilService:
                 )
             )
 
+        parallel_enabled = bool(
+            self._chairman and self._settings.chairman.parallel_member_evaluation
+        )
+        initial_votes: list[MemberVote] = []
+        initial_workflow: Any | None = None
+        deferred_cancellation = False
+
         # Chairman decides threshold (if configured)
         chairman_decision = None
         chairman_info = None
-        if self._chairman:
+        if parallel_enabled:
+            timing_model = "overlapping"
+            preflight_started = time.perf_counter()
+            preflight_result = await self._preflight_intent(intent)
+            preflight_ms = _stage(
+                stages, tool, "preflight", preflight_started, intent_id=intent.intent_id
+            )
+            stage_intervals.append(
+                self._stage_interval(
+                    name="preflight",
+                    start=preflight_started,
+                    total_start=total_start,
+                    duration_ms=preflight_ms,
+                )
+            )
+            if not preflight_result.success or preflight_result.preflight is None:
+                _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
+                self._publish_latency(
+                    tool=tool,
+                    intent_id=intent.intent_id,
+                    outcome="error",
+                    stages=stages,
+                    actors=actors,
+                    stage_intervals=stage_intervals,
+                    timing_model=timing_model,
+                )
+                return ProposeIntentOutput(
+                    api_version=input_data.api_version,
+                    council_id=effective_council_id,
+                    success=False,
+                    intent_id=intent.intent_id,
+                    error=preflight_result.error or "Council preflight failed",
+                    code_review=code_review_vote,
+                )
+
+            preflight = preflight_result.preflight
+            if preflight.policy_evaluation.decision.decision == DecisionType.DENY:
+                commit_started = time.perf_counter()
+                try:
+                    (
+                        result,
+                        _,
+                        _,
+                        submit_ms,
+                        tally_ms,
+                        deferred_cancellation,
+                    ) = await self._commit_parallel_initial_review(
+                        intent,
+                        preflight,
+                        [],
+                        review_threshold=None,
+                        enable_debate=False,
+                        request_type="propose",
+                    )
+                except BaseException:
+                    # Any exit before submit_intent consumes the reservation must
+                    # give the pending slot back, including BaseException kinds
+                    # that are neither CancelledError nor Exception.
+                    await self._release_preflight_safely(preflight)
+                    raise
+                stages["submit"] = submit_ms
+                stages["tally"] = tally_ms
+                stage_intervals.append(
+                    self._stage_interval(
+                        name="submit",
+                        start=commit_started,
+                        total_start=total_start,
+                        duration_ms=submit_ms,
+                    )
+                )
+            else:
+                try:
+                    chairman_decision, evaluations = await self._run_parallel_initial_calls(
+                        intent,
+                        lambda: self._chairman.decide_threshold(intent),  # type: ignore[union-attr]
+                        lambda _decision: True,
+                        total_start=total_start,
+                        stages=stages,
+                        stage_intervals=stage_intervals,
+                        actors=actors,
+                    )
+                except asyncio.CancelledError:
+                    await self._release_preflight_safely(preflight)
+                    raise
+                except Exception:
+                    await self._release_preflight_safely(preflight)
+                    _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
+                    self._publish_latency(
+                        tool=tool,
+                        intent_id=intent.intent_id,
+                        outcome="error",
+                        stages=stages,
+                        actors=actors,
+                        stage_intervals=stage_intervals,
+                        timing_model=timing_model,
+                    )
+                    return ProposeIntentOutput(
+                        api_version=input_data.api_version,
+                        council_id=effective_council_id,
+                        success=False,
+                        intent_id=intent.intent_id,
+                        error="Chairman evaluation failed",
+                        code_review=code_review_vote,
+                    )
+
+                if evaluations is None:
+                    await self._release_preflight_safely(preflight)
+                    _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
+                    self._publish_latency(
+                        tool=tool,
+                        intent_id=intent.intent_id,
+                        outcome="error",
+                        stages=stages,
+                        actors=actors,
+                        stage_intervals=stage_intervals,
+                        timing_model=timing_model,
+                    )
+                    return ProposeIntentOutput(
+                        api_version=input_data.api_version,
+                        council_id=effective_council_id,
+                        success=False,
+                        intent_id=intent.intent_id,
+                        error="Council review produced no member evaluations",
+                        code_review=code_review_vote,
+                    )
+                chairman_info = ChairmanInfo(
+                    threshold=chairman_decision.threshold,
+                    reasoning=chairman_decision.reasoning,
+                    risk_level=chairman_decision.risk_level,
+                )
+                commit_started = time.perf_counter()
+                try:
+                    (
+                        result,
+                        initial_votes,
+                        initial_workflow,
+                        submit_ms,
+                        tally_ms,
+                        deferred_cancellation,
+                    ) = await self._commit_parallel_initial_review(
+                        intent,
+                        preflight,
+                        evaluations,
+                        review_threshold=chairman_decision.threshold,
+                        enable_debate=enable_debate,
+                        request_type="propose",
+                    )
+                except BaseException:
+                    # Any exit before submit_intent consumes the reservation must
+                    # give the pending slot back, including BaseException kinds
+                    # that are neither CancelledError nor Exception.
+                    await self._release_preflight_safely(preflight)
+                    raise
+                stages["submit"] = submit_ms
+                stages["tally"] = tally_ms
+                stage_intervals.extend(
+                    [
+                        self._stage_interval(
+                            name="submit",
+                            start=commit_started,
+                            total_start=total_start,
+                            duration_ms=submit_ms,
+                        ),
+                        self._stage_interval(
+                            name="tally",
+                            start=commit_started + (submit_ms / 1000),
+                            total_start=total_start,
+                            duration_ms=tally_ms,
+                        ),
+                    ]
+                )
+        elif self._chairman:
             stage_start = time.perf_counter()
             chairman_decision = await self._chairman.decide_threshold(intent)
             chairman_ms = _stage(stages, tool, "chairman", stage_start, intent_id=intent.intent_id)
@@ -1919,27 +2674,20 @@ class CouncilService:
                 risk_level=chairman_decision.risk_level,
             )
 
-        stage_start = time.perf_counter()
-        # Submit to council for policy evaluation. The thread keeps the ledger
-        # file append off the event loop; the lock preserves the serialization
-        # submit_intent relies on.
-        async with self._submit_lock:
-            result = await asyncio.to_thread(
-                self._council.submit_intent,
-                intent,
-                review_threshold=chairman_decision.threshold if chairman_decision else None,
-            )
-        _stage(stages, tool, "submit", stage_start, intent_id=intent.intent_id)
+        if not parallel_enabled:
+            stage_start = time.perf_counter()
+            # Submit to council for policy evaluation. The thread keeps the ledger
+            # file append off the event loop; the lock preserves the serialization
+            # submit_intent relies on.
+            async with self._submit_lock:
+                result = await asyncio.to_thread(
+                    self._council.submit_intent,
+                    intent,
+                    review_threshold=chairman_decision.threshold if chairman_decision else None,
+                )
+            _stage(stages, tool, "submit", stage_start, intent_id=intent.intent_id)
 
         if not result.success:
-            _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
-            self._publish_latency(
-                tool=tool,
-                intent_id=intent.intent_id,
-                outcome="error",
-                stages=stages,
-                actors=actors,
-            )
             # Policy DENY is a final review outcome → one consolidated record.
             # A submission error (missing justification, max-pending) is not an
             # accepted-and-reviewed intent → no audit entry.
@@ -1951,9 +2699,25 @@ class CouncilService:
                     decision="deny",
                     workflow=result.workflow,
                     opa_decision=opa_decision,
-                    chairman=chairman_info,
+                    # A deterministic policy denial owns this outcome.  The
+                    # legacy path may already have called the chairman, but its
+                    # result did not participate and cannot exist on the
+                    # required zero-LLM parallel short circuit.
+                    chairman=None,
                     code_review=code_review_vote,
                 )
+            _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
+            self._publish_latency(
+                tool=tool,
+                intent_id=intent.intent_id,
+                outcome="error",
+                stages=stages,
+                actors=actors,
+                stage_intervals=stage_intervals or None,
+                timing_model=timing_model,
+            )
+            if deferred_cancellation:
+                raise asyncio.CancelledError
             return ProposeIntentOutput(
                 api_version=input_data.api_version,
                 council_id=effective_council_id,
@@ -1964,24 +2728,50 @@ class CouncilService:
                 code_review=code_review_vote,
             )
 
-        stage_start = time.perf_counter()
-        votes, debate_history, debate_rounds_completed, state = await self._collect_review_outcome(
-            intent,
-            enable_debate=enable_debate,
-            max_debate_rounds=max_debate_rounds,
-            actor_timings=actors,
-        )
-        _stage(stages, tool, "review_collect", stage_start, intent_id=intent.intent_id)
+        if parallel_enabled:
+            review_continuation_started = time.perf_counter()
+            if (
+                initial_workflow is not None
+                and initial_workflow.state != WorkflowState.AWAITING_APPROVAL
+            ):
+                votes = initial_votes
+                debate_history = [DebateRound(round_number=0, votes=list(votes))]
+                debate_rounds_completed = 0
+                state = initial_workflow.state
+            else:
+                continuation, continuation_cancelled = await self._shield_and_drain(
+                    asyncio.create_task(
+                        self._continue_review_outcome(
+                            intent,
+                            initial_votes,
+                            initial_workflow,
+                            enable_debate=enable_debate,
+                            max_debate_rounds=max_debate_rounds,
+                            actor_timings=actors,
+                        )
+                    )
+                )
+                votes, debate_history, debate_rounds_completed, state = continuation
+                deferred_cancellation = deferred_cancellation or continuation_cancelled
+            stages["review_collect"] = stages.get("member_evaluation", 0.0) + _elapsed_ms(
+                review_continuation_started
+            )
+        else:
+            stage_start = time.perf_counter()
+            (
+                votes,
+                debate_history,
+                debate_rounds_completed,
+                state,
+            ) = await self._collect_review_outcome(
+                intent,
+                enable_debate=enable_debate,
+                max_debate_rounds=max_debate_rounds,
+                actor_timings=actors,
+            )
+            _stage(stages, tool, "review_collect", stage_start, intent_id=intent.intent_id)
         state_value = state.value if state else "unknown"
 
-        _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
-        self._publish_latency(
-            tool=tool,
-            intent_id=intent.intent_id,
-            outcome=state_value,
-            stages=stages,
-            actors=actors,
-        )
         if state in (WorkflowState.APPROVED, WorkflowState.DENIED):
             self._record_consolidated_review(
                 intent,
@@ -1994,8 +2784,20 @@ class CouncilService:
                 chairman=chairman_info,
                 code_review=code_review_vote,
                 debate_history=debate_history,
-                timing={"stages_ms": dict(stages), "actors": list(actors)},
+                timing=self._review_timing(stages, actors, stage_intervals, timing_model),
             )
+        _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
+        self._publish_latency(
+            tool=tool,
+            intent_id=intent.intent_id,
+            outcome=state_value,
+            stages=stages,
+            actors=actors,
+            stage_intervals=stage_intervals or None,
+            timing_model=timing_model,
+        )
+        if deferred_cancellation:
+            raise asyncio.CancelledError
         return ProposeIntentOutput(
             api_version=input_data.api_version,
             council_id=effective_council_id,
@@ -2017,51 +2819,115 @@ class CouncilService:
         finalize: bool = True,
         actor_timings: list[dict[str, Any]] | None = None,
     ) -> list[MemberVote]:
-        """Run all council member LLM evaluations in parallel."""
-        votes: list[MemberVote] = []
+        """Compatibility wrapper that evaluates members and immediately records votes."""
+        evaluations = await self._evaluate_agents(intent, actor_timings=actor_timings)
+        return self._record_agent_votes(intent, evaluations, finalize=finalize)
+
+    async def _evaluate_agents(
+        self,
+        intent: Intent,
+        *,
+        actor_timings: list[dict[str, Any]] | None = None,
+    ) -> list[PendingMemberEvaluation]:
+        """Evaluate members concurrently without creating workflows or casting votes."""
         if not self._agents:
-            return votes
+            return []
 
         async def _evaluate_one(
             agent: CouncilMemberAgent,
-        ) -> tuple[CouncilMemberAgent, IntentEvaluation | Exception, float]:
+        ) -> PendingMemberEvaluation:
             started = time.perf_counter()
             try:
-                return agent, await agent.evaluate_intent(intent), _elapsed_ms(started)
-            except Exception as exc:
-                return agent, exc, _elapsed_ms(started)
-
-        evaluations = await asyncio.gather(
-            *[_evaluate_one(agent) for agent in self._agents],
-        )
-
-        for agent, eval_result, duration_ms in evaluations:
-            if isinstance(eval_result, Exception):
-                eval_result = IntentEvaluation(
-                    decision="deny",
-                    reasoning=f"Evaluation error: {eval_result}",
-                )
-            if actor_timings is not None:
-                actor_timings.append(
-                    self._actor_latency(
-                        role="council_member",
-                        member_id=agent.member_id,
-                        provider=agent.provider_name,
-                        duration_ms=duration_ms,
-                        decision=eval_result.decision,
-                        timing=getattr(eval_result, "timing", None),
+                evaluation = await agent.evaluate_intent(intent)
+                duration_ms = _elapsed_ms(started)
+                if actor_timings is not None:
+                    actor_timings.append(
+                        self._actor_latency(
+                            role="council_member",
+                            member_id=agent.member_id,
+                            provider=agent.provider_name,
+                            duration_ms=duration_ms,
+                            decision=evaluation.decision,
+                            timing=getattr(evaluation, "timing", None),
+                        )
                     )
+                return PendingMemberEvaluation(
+                    agent=agent,
+                    evaluation=evaluation,
+                    duration_ms=duration_ms,
+                )
+            except asyncio.CancelledError:
+                if actor_timings is not None:
+                    actor_timings.append(
+                        self._actor_latency(
+                            role="council_member",
+                            member_id=agent.member_id,
+                            provider=agent.provider_name,
+                            duration_ms=_elapsed_ms(started),
+                            decision="",
+                            status="cancelled",
+                        )
+                    )
+                raise
+            except Exception as exc:
+                evaluation = IntentEvaluation(
+                    decision="deny",
+                    reasoning=f"Evaluation error: {exc}",
+                )
+                duration_ms = _elapsed_ms(started)
+                if actor_timings is not None:
+                    actor_timings.append(
+                        self._actor_latency(
+                            role="council_member",
+                            member_id=agent.member_id,
+                            provider=agent.provider_name,
+                            duration_ms=duration_ms,
+                            decision="deny",
+                            status="error",
+                        )
+                    )
+                return PendingMemberEvaluation(
+                    agent=agent,
+                    evaluation=evaluation,
+                    duration_ms=duration_ms,
                 )
 
+        tasks = [asyncio.create_task(_evaluate_one(agent)) for agent in self._agents]
+        try:
+            return list(await asyncio.gather(*tasks))
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        except Exception:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+    def _record_agent_votes(
+        self,
+        intent: Intent,
+        evaluations: list[PendingMemberEvaluation],
+        *,
+        finalize: bool = False,
+    ) -> list[MemberVote]:
+        """Cast buffered member evaluations in configured member order."""
+        votes: list[MemberVote] = []
+
+        for pending in evaluations:
+            agent = pending.agent
+            eval_result = pending.evaluation
             votes.append(
                 MemberVote(
                     member_id=agent.member_id,
                     display_name=agent.display_name,
-                    decision=eval_result.decision,  # type: ignore[union-attr]
-                    reasoning=eval_result.reasoning,  # type: ignore[union-attr]
-                    risk_concerns=eval_result.risk_concerns,  # type: ignore[union-attr]
-                    conditions=eval_result.conditions,  # type: ignore[union-attr]
-                    guidance=eval_result.guidance,  # type: ignore[union-attr]
+                    decision=eval_result.decision,
+                    reasoning=eval_result.reasoning,
+                    risk_concerns=eval_result.risk_concerns,
+                    conditions=eval_result.conditions,
+                    guidance=eval_result.guidance,
                 )
             )
 
@@ -2069,10 +2935,8 @@ class CouncilService:
             vote_result = self._council.cast_member_vote(
                 intent.intent_id,
                 agent.member_id,
-                VoteType.APPROVE
-                if eval_result.decision == "approve"  # type: ignore[union-attr]
-                else VoteType.DENY,
-                reason=eval_result.reasoning,  # type: ignore[union-attr]
+                VoteType.APPROVE if eval_result.decision == "approve" else VoteType.DENY,
+                reason=eval_result.reasoning,
                 finalize=finalize,
             )
             if not vote_result.success:
@@ -2269,6 +3133,8 @@ class CouncilService:
         tool = "council_authorize"
         stages: dict[str, float] = {}
         actors: list[dict[str, Any]] = []
+        stage_intervals: list[dict[str, Any]] = []
+        timing_model: str | None = None
         total_start = time.perf_counter()
         stage_start = time.perf_counter()
         if input_data.api_version == API_VERSION_V2 and not input_data.council_id:
@@ -2360,6 +3226,10 @@ class CouncilService:
 
         try:
             intent = Intent.create(**intent_kwargs)
+            if input_data.tool_call is not None:
+                # Keep exact business arguments in process only for this
+                # review; the durable Intent and writ use the derived digest.
+                intent._tool_review_material = input_data.tool_call
         except Exception as e:
             _stage(stages, tool, "intent_build", stage_start)
             _stage(stages, tool, "total", total_start)
@@ -2407,14 +3277,6 @@ class CouncilService:
         )
         _stage(stages, tool, "opa", stage_start, intent_id=intent.intent_id)
         if opa_decision is not None and not opa_decision.allow:
-            _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
-            self._publish_latency(
-                tool=tool,
-                intent_id=intent.intent_id,
-                outcome="denied",
-                stages=stages,
-                actors=actors,
-            )
             self._record_consolidated_review(
                 intent,
                 request_type="authorize",
@@ -2422,6 +3284,14 @@ class CouncilService:
                 decision="deny",
                 opa_decision=opa_decision,
                 denial_reason=self._opa_denial_error(opa_decision),
+            )
+            _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
+            self._publish_latency(
+                tool=tool,
+                intent_id=intent.intent_id,
+                outcome="denied",
+                stages=stages,
+                actors=actors,
             )
             return AuthorizeOutput(
                 api_version=input_data.api_version,
@@ -2450,10 +3320,239 @@ class CouncilService:
                 )
             )
 
+        parallel_enabled = bool(
+            self._chairman and self._settings.chairman.parallel_member_evaluation
+        )
+        initial_votes: list[MemberVote] = []
+        initial_workflow: Any | None = None
+        deferred_cancellation = False
+
         # 4. Chairman pre-auth (if configured and agent is authenticated)
         chairman_info = None
         pre_auth: ChairmanPreAuthDecision | None = None
-        if self._chairman and agent_identity:
+        if parallel_enabled:
+            timing_model = "overlapping"
+            preflight_started = time.perf_counter()
+            preflight_result = await self._preflight_intent(intent)
+            preflight_ms = _stage(
+                stages, tool, "preflight", preflight_started, intent_id=intent.intent_id
+            )
+            stage_intervals.append(
+                self._stage_interval(
+                    name="preflight",
+                    start=preflight_started,
+                    total_start=total_start,
+                    duration_ms=preflight_ms,
+                )
+            )
+            if not preflight_result.success or preflight_result.preflight is None:
+                _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
+                self._publish_latency(
+                    tool=tool,
+                    intent_id=intent.intent_id,
+                    outcome="error",
+                    stages=stages,
+                    actors=actors,
+                    stage_intervals=stage_intervals,
+                    timing_model=timing_model,
+                )
+                return AuthorizeOutput(
+                    api_version=input_data.api_version,
+                    council_id=effective_council_id,
+                    status="error",
+                    decision_id=intent.intent_id,
+                    error=preflight_result.error or "Council preflight failed",
+                    code_review=code_review_vote,
+                )
+
+            preflight = preflight_result.preflight
+            if preflight.policy_evaluation.decision.decision == DecisionType.DENY:
+                commit_started = time.perf_counter()
+                try:
+                    (
+                        result,
+                        _,
+                        _,
+                        submit_ms,
+                        tally_ms,
+                        deferred_cancellation,
+                    ) = await self._commit_parallel_initial_review(
+                        intent,
+                        preflight,
+                        [],
+                        review_threshold=None,
+                        enable_debate=False,
+                        request_type="authorize",
+                    )
+                except BaseException:
+                    # Any exit before submit_intent consumes the reservation must
+                    # give the pending slot back, including BaseException kinds
+                    # that are neither CancelledError nor Exception.
+                    await self._release_preflight_safely(preflight)
+                    raise
+                stages["submit"] = submit_ms
+                stages["tally"] = tally_ms
+                stage_intervals.append(
+                    self._stage_interval(
+                        name="submit",
+                        start=commit_started,
+                        total_start=total_start,
+                        duration_ms=submit_ms,
+                    )
+                )
+            else:
+
+                async def chairman_call() -> Any:
+                    if agent_identity:
+                        return await self._chairman.pre_authorize(  # type: ignore[union-attr]
+                            intent=intent,
+                            agent_permissions=agent_permissions,
+                            required_permissions={p.value for p in required_perms},
+                        )
+                    return await self._chairman.decide_threshold(intent)  # type: ignore[union-attr]
+
+                def chairman_authorizes(decision: Any) -> bool:
+                    return not agent_identity or bool(decision.authorized)
+
+                try:
+                    chairman_result, evaluations = await self._run_parallel_initial_calls(
+                        intent,
+                        chairman_call,
+                        chairman_authorizes,
+                        total_start=total_start,
+                        stages=stages,
+                        stage_intervals=stage_intervals,
+                        actors=actors,
+                    )
+                except asyncio.CancelledError:
+                    await self._release_preflight_safely(preflight)
+                    raise
+                except Exception:
+                    await self._release_preflight_safely(preflight)
+                    _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
+                    self._publish_latency(
+                        tool=tool,
+                        intent_id=intent.intent_id,
+                        outcome="error",
+                        stages=stages,
+                        actors=actors,
+                        stage_intervals=stage_intervals,
+                        timing_model=timing_model,
+                    )
+                    return AuthorizeOutput(
+                        api_version=input_data.api_version,
+                        council_id=effective_council_id,
+                        status="error",
+                        decision_id=intent.intent_id,
+                        error="Chairman evaluation failed",
+                        code_review=code_review_vote,
+                    )
+
+                if agent_identity:
+                    pre_auth = chairman_result
+                else:
+                    pre_auth = ChairmanPreAuthDecision(
+                        authorized=True,
+                        threshold=chairman_result.threshold,
+                        risk_level=chairman_result.risk_level,
+                        reasoning=chairman_result.reasoning,
+                    )
+
+                assert pre_auth is not None
+                if not pre_auth.authorized:
+                    await self._release_preflight_safely(preflight)
+                    _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
+                    self._publish_latency(
+                        tool=tool,
+                        intent_id=intent.intent_id,
+                        outcome="denied",
+                        stages=stages,
+                        actors=actors,
+                        stage_intervals=stage_intervals,
+                        timing_model=timing_model,
+                    )
+                    return AuthorizeOutput(
+                        api_version=input_data.api_version,
+                        council_id=effective_council_id,
+                        status="denied",
+                        decision_id=intent.intent_id,
+                        error="Insufficient permissions",
+                        missing_permissions=pre_auth.missing_permissions,
+                        code_review=code_review_vote,
+                        chairman=ChairmanInfo(
+                            threshold="",
+                            reasoning=pre_auth.reasoning,
+                            risk_level=pre_auth.risk_level,
+                        ),
+                    )
+
+                if evaluations is None:
+                    await self._release_preflight_safely(preflight)
+                    _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
+                    self._publish_latency(
+                        tool=tool,
+                        intent_id=intent.intent_id,
+                        outcome="error",
+                        stages=stages,
+                        actors=actors,
+                        stage_intervals=stage_intervals,
+                        timing_model=timing_model,
+                    )
+                    return AuthorizeOutput(
+                        api_version=input_data.api_version,
+                        council_id=effective_council_id,
+                        status="error",
+                        decision_id=intent.intent_id,
+                        error="Council review produced no member evaluations",
+                        code_review=code_review_vote,
+                    )
+                chairman_info = ChairmanInfo(
+                    threshold=pre_auth.threshold or "unanimous",
+                    reasoning=pre_auth.reasoning,
+                    risk_level=pre_auth.risk_level,
+                )
+                commit_started = time.perf_counter()
+                try:
+                    (
+                        result,
+                        initial_votes,
+                        initial_workflow,
+                        submit_ms,
+                        tally_ms,
+                        deferred_cancellation,
+                    ) = await self._commit_parallel_initial_review(
+                        intent,
+                        preflight,
+                        evaluations,
+                        review_threshold=pre_auth.threshold or None,
+                        enable_debate=enable_debate,
+                        request_type="authorize",
+                    )
+                except BaseException:
+                    # Any exit before submit_intent consumes the reservation must
+                    # give the pending slot back, including BaseException kinds
+                    # that are neither CancelledError nor Exception.
+                    await self._release_preflight_safely(preflight)
+                    raise
+                stages["submit"] = submit_ms
+                stages["tally"] = tally_ms
+                stage_intervals.extend(
+                    [
+                        self._stage_interval(
+                            name="submit",
+                            start=commit_started,
+                            total_start=total_start,
+                            duration_ms=submit_ms,
+                        ),
+                        self._stage_interval(
+                            name="tally",
+                            start=commit_started + (submit_ms / 1000),
+                            total_start=total_start,
+                            duration_ms=tally_ms,
+                        ),
+                    ]
+                )
+        elif self._chairman and agent_identity:
             stage_start = time.perf_counter()
             pre_auth = await self._chairman.pre_authorize(
                 intent=intent,
@@ -2526,35 +3625,28 @@ class CouncilService:
                 risk_level=chairman_decision.risk_level,
             )
 
-        stage_start = time.perf_counter()
-        # Submit to council — policy engine runs here (DENY blocks LLM
-        # evaluation). The thread keeps the ledger file append off the event
-        # loop; the lock preserves the serialization submit_intent relies on.
-        async with self._submit_lock:
-            result = await asyncio.to_thread(
-                self._council.submit_intent,
-                intent,
-                review_threshold=pre_auth.threshold if pre_auth and pre_auth.threshold else None,
-            )
-        _stage(stages, tool, "submit", stage_start, intent_id=intent.intent_id)
+        if not parallel_enabled:
+            stage_start = time.perf_counter()
+            # Submit to council — policy engine runs here (DENY blocks LLM
+            # evaluation). The thread keeps the ledger file append off the event
+            # loop; the lock preserves the serialization submit_intent relies on.
+            async with self._submit_lock:
+                result = await asyncio.to_thread(
+                    self._council.submit_intent,
+                    intent,
+                    review_threshold=pre_auth.threshold
+                    if pre_auth and pre_auth.threshold
+                    else None,
+                )
+            _stage(stages, tool, "submit", stage_start, intent_id=intent.intent_id)
         if not result.success:
             # Distinguish a deterministic policy DENY from a submission error
-            from nomos.level_1.policy.rules import DecisionType
-
             workflow = result.workflow
             if (
                 workflow is not None
                 and workflow.evaluation_result is not None
                 and workflow.evaluation_result.decision.decision == DecisionType.DENY
             ):
-                _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
-                self._publish_latency(
-                    tool=tool,
-                    intent_id=intent.intent_id,
-                    outcome="denied",
-                    stages=stages,
-                    actors=actors,
-                )
                 self._record_consolidated_review(
                     intent,
                     request_type="authorize",
@@ -2562,9 +3654,21 @@ class CouncilService:
                     decision="deny",
                     workflow=workflow,
                     opa_decision=opa_decision,
-                    chairman=chairman_info,
+                    chairman=None,
                     code_review=code_review_vote,
                 )
+                _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
+                self._publish_latency(
+                    tool=tool,
+                    intent_id=intent.intent_id,
+                    outcome="denied",
+                    stages=stages,
+                    actors=actors,
+                    stage_intervals=stage_intervals or None,
+                    timing_model=timing_model,
+                )
+                if deferred_cancellation:
+                    raise asyncio.CancelledError
                 return AuthorizeOutput(
                     api_version=input_data.api_version,
                     council_id=effective_council_id,
@@ -2580,7 +3684,11 @@ class CouncilService:
                 outcome="error",
                 stages=stages,
                 actors=actors,
+                stage_intervals=stage_intervals or None,
+                timing_model=timing_model,
             )
+            if deferred_cancellation:
+                raise asyncio.CancelledError
             return AuthorizeOutput(
                 api_version=input_data.api_version,
                 council_id=effective_council_id,
@@ -2590,18 +3698,68 @@ class CouncilService:
                 code_review=code_review_vote,
             )
 
-        stage_start = time.perf_counter()
-        votes, debate_history, debate_rounds_completed, state = await self._collect_review_outcome(
-            intent,
-            enable_debate=enable_debate,
-            max_debate_rounds=max_debate_rounds,
-            actor_timings=actors,
-        )
-        _stage(stages, tool, "review_collect", stage_start, intent_id=intent.intent_id)
+        if parallel_enabled:
+            review_continuation_started = time.perf_counter()
+            if (
+                initial_workflow is not None
+                and initial_workflow.state != WorkflowState.AWAITING_APPROVAL
+            ):
+                votes = initial_votes
+                debate_history = [DebateRound(round_number=0, votes=list(votes))]
+                debate_rounds_completed = 0
+                state = initial_workflow.state
+            else:
+                continuation, continuation_cancelled = await self._shield_and_drain(
+                    asyncio.create_task(
+                        self._continue_review_outcome(
+                            intent,
+                            initial_votes,
+                            initial_workflow,
+                            enable_debate=enable_debate,
+                            max_debate_rounds=max_debate_rounds,
+                            actor_timings=actors,
+                        )
+                    )
+                )
+                votes, debate_history, debate_rounds_completed, state = continuation
+                deferred_cancellation = deferred_cancellation or continuation_cancelled
+            stages["review_collect"] = stages.get("member_evaluation", 0.0) + _elapsed_ms(
+                review_continuation_started
+            )
+        else:
+            stage_start = time.perf_counter()
+            (
+                votes,
+                debate_history,
+                debate_rounds_completed,
+                state,
+            ) = await self._collect_review_outcome(
+                intent,
+                enable_debate=enable_debate,
+                max_debate_rounds=max_debate_rounds,
+                actor_timings=actors,
+            )
+            _stage(stages, tool, "review_collect", stage_start, intent_id=intent.intent_id)
         approved = state == WorkflowState.APPROVED
 
         if not approved:
-            guidance_parts = [v.guidance for v in votes if v.guidance]
+            guidance_parts = build_denial_guidance(votes)
+            if deferred_cancellation:
+                if state == WorkflowState.DENIED:
+                    self._record_consolidated_review(
+                        intent,
+                        request_type="authorize",
+                        final_state=state.value,
+                        decision="deny",
+                        workflow=self._council.get_workflow(intent.intent_id),
+                        opa_decision=opa_decision,
+                        votes=votes,
+                        chairman=chairman_info,
+                        code_review=code_review_vote,
+                        debate_history=debate_history,
+                        timing=self._review_timing(stages, actors, stage_intervals, timing_model),
+                    )
+                raise asyncio.CancelledError
             # Record denial in Redis
             durable = self._durable()
             if durable is not None:
@@ -2611,6 +3769,11 @@ class CouncilService:
                         {
                             "intent_id": intent.intent_id,
                             "command": input_data.command,
+                            "operation": (
+                                intent.operation.model_dump(mode="json")
+                                if intent.operation is not None
+                                else None
+                            ),
                             "agent_id": input_data.agent_id,
                             "decision": "denied",
                             "decided_at": __import__("time").time(),
@@ -2619,14 +3782,6 @@ class CouncilService:
                 except Exception:  # noqa: S110
                     pass
 
-            _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
-            self._publish_latency(
-                tool=tool,
-                intent_id=intent.intent_id,
-                outcome="denied",
-                stages=stages,
-                actors=actors,
-            )
             if state == WorkflowState.DENIED:
                 self._record_consolidated_review(
                     intent,
@@ -2639,8 +3794,18 @@ class CouncilService:
                     chairman=chairman_info,
                     code_review=code_review_vote,
                     debate_history=debate_history,
-                    timing={"stages_ms": dict(stages), "actors": list(actors)},
+                    timing=self._review_timing(stages, actors, stage_intervals, timing_model),
                 )
+            _stage(stages, tool, "total", total_start, intent_id=intent.intent_id)
+            self._publish_latency(
+                tool=tool,
+                intent_id=intent.intent_id,
+                outcome="denied",
+                stages=stages,
+                actors=actors,
+                stage_intervals=stage_intervals or None,
+                timing_model=timing_model,
+            )
             return AuthorizeOutput(
                 api_version=input_data.api_version,
                 council_id=effective_council_id,
@@ -2666,8 +3831,10 @@ class CouncilService:
             chairman=chairman_info,
             code_review=code_review_vote,
             debate_history=debate_history,
-            timing={"stages_ms": dict(stages), "actors": list(actors)},
+            timing=self._review_timing(stages, actors, stage_intervals, timing_model),
         )
+        if deferred_cancellation:
+            raise asyncio.CancelledError
 
         # Guard on the active signer, not the key manager: in vault mode the
         # signer is the VaultTransitSigner and _key_manager is intentionally None.
@@ -2679,6 +3846,8 @@ class CouncilService:
                 outcome="error",
                 stages=stages,
                 actors=actors,
+                stage_intervals=stage_intervals or None,
+                timing_model=timing_model,
             )
             return AuthorizeOutput(
                 api_version=input_data.api_version,
@@ -2731,6 +3900,8 @@ class CouncilService:
             outcome="approved",
             stages=stages,
             actors=actors,
+            stage_intervals=stage_intervals or None,
+            timing_model=timing_model,
         )
         return AuthorizeOutput(
             api_version=input_data.api_version,

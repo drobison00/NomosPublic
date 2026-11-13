@@ -1,13 +1,6 @@
 <!--
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-
-NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-property and proprietary rights in and to this material, related
-documentation and any modifications thereto. Any use, reproduction,
-disclosure or distribution of this material and related documentation
-without an express license agreement from NVIDIA CORPORATION or
-its affiliates is strictly prohibited.
+SPDX-License-Identifier: Apache-2.0
 -->
 
 <!doctype html>
@@ -797,9 +790,12 @@ its affiliates is strictly prohibited.
         <p class="eyebrow">Nomos workflow</p>
         <h1>From agent intent to signed execution</h1>
         <p class="lead">
-          This walkthrough explains the current authorization path: monitored MCP
-          ingress, optional multi-council routing, OPA filtering, LLM council
-          review, writ minting, executor verification, and audit visibility.
+          Nomos stops unwanted or overeager agent actions by reviewing each one
+          against the agent's own context: its permissions, its task, its
+          justification and the signed receipts of what it has observed. This
+          walkthrough explains that authorization path: monitored MCP ingress,
+          optional multi-council routing, OPA filtering, LLM council review, writ
+          minting, executor verification, and audit visibility.
         </p>
       </div>
       <aside class="quick-card" aria-label="Core invariant">
@@ -1236,9 +1232,9 @@ its affiliates is strictly prohibited.
             <td>Change members, prompts, backends, OPA policy, ledger path.</td>
           </tr>
           <tr>
-            <td><code>configs/git_workflow_council.yaml</code></td>
-            <td>Git-workflow specialized council.</td>
-            <td>Tune git and GitHub CLI review rules, relaxed OPA profile, quorum opt-in.</td>
+            <td><code>policies/intent_filter.rego</code></td>
+            <td>The bundled OPA front-door policy and its policy ids.</td>
+            <td>Tune the deterministic allow/deny rules per <code>opa_policy_id</code> (<code>strict-shell</code>, <code>git-workflow-local</code>).</td>
           </tr>
           <tr>
             <td><code>scripts/agent_accounts.sh</code></td>
@@ -1264,9 +1260,9 @@ its affiliates is strictly prohibited.
         Related docs:
         <a href="multi-council.html">Multiple Councils</a>,
         <a href="mcp-integration.html">MCP Integration</a>,
-        <a href="../../README.md#writ-of-execution">Writ of Execution</a>,
+        <a href="../architecture.md#writ-of-execution">Writ of Execution</a>,
         <a href="writ-executor.html">Writ Executor</a>,
-        <a href="../../README.md#configuration-reference">Configuration Reference</a>.
+        <a href="../reference/configuration.md#configuration-reference">Configuration Reference</a>.
       </p>
     </footer>
   </main>
@@ -1412,7 +1408,7 @@ its affiliates is strictly prohibited.
 
     function restartAnimation(element, className) {
       element.classList.remove(className);
-      void element.offsetWidth;
+      element.getBoundingClientRect();
       element.classList.add(className);
     }
 

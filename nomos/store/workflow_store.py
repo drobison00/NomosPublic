@@ -1,16 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """
-PostgreSQL-backed read cache for council workflow state (NOMOS-5b, minimal-correct).
+PostgreSQL-backed read cache for council workflow state (minimal-correct).
 
 Lets multiple council replicas share workflow *status*: any replica can answer a
 ``check_intent_status`` / ``get_pending_approvals`` query for an intent that was

@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """
 Tests for LLM backend abstraction and council member agent.
@@ -25,6 +17,7 @@ from nomos.level_0.types import Intent, PackagedFile
 from nomos.llm.base import LLMBackend, LLMMessage, LLMResponse, LLMRole
 from nomos.llm.council_agent import (
     ChairmanAgent,
+    CodeReviewAgent,
     CouncilMemberAgent,
     _format_intent_for_review,
     _parse_code_review_evaluation,
@@ -152,7 +145,8 @@ class TestParseEvaluation:
         assert result.decision == "deny"
         assert result.reasoning == "Too risky"
 
-    def test_parse_code_review_requires_clear_json_schema(self):
+    @pytest.mark.parametrize("observed_operations", [["prints ok to stdout"], []])
+    def test_parse_code_review_requires_clear_json_schema(self, observed_operations):
         packaged_file = PackagedFile(
             path="scripts/task.py",
             content_base64="cHJpbnQoJ29rJykK",
@@ -181,7 +175,7 @@ class TestParseEvaluation:
                         "mode": "0600",
                         "review_status": "complete",
                         "matches_claimed_behavior": "yes",
-                        "observed_operations": ["prints ok to stdout"],
+                        "observed_operations": observed_operations,
                         "risk_findings": [],
                         "evidence": ["print('ok')"],
                     }
@@ -192,6 +186,11 @@ class TestParseEvaluation:
             }
         )
 
+        if not observed_operations:
+            with pytest.raises(ValueError, match="observed_operations"):
+                _parse_code_review_evaluation(content, intent)
+            return
+
         result = _parse_code_review_evaluation(content, intent)
         formatted = format_code_review_result_json(result)
 
@@ -199,6 +198,12 @@ class TestParseEvaluation:
         assert result.files[0].path == "scripts/task.py"
         assert result.files[0].sha256 == packaged_file.sha256
         assert '"observed_operations": [' in formatted
+
+    def test_code_review_prompt_requires_operations_for_every_file(self):
+        prompt = CodeReviewAgent._default_system_prompt()
+        assert "Include stdout output such as print statements" in prompt
+        assert "Every file needs at least one observed_operations" in prompt
+        assert "even when it has no side effects" in prompt
 
     def test_parse_code_review_rejects_generic_vote_json(self):
         packaged_file = PackagedFile(

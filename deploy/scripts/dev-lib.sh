@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 # shellcheck shell=bash
 #
 # Shared helpers for the Nomos local dev bootstrappers (Kind + docker-compose).
@@ -20,7 +13,12 @@ ENV_FILE="${ENV_FILE:-$ROOT_DIR/deploy/.env}"
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-nomos}"
 NAMESPACE="${NAMESPACE:-nomos}"
 HELM_RELEASE="${HELM_RELEASE:-nomos}"
-COMPOSE_PROJECT="${COMPOSE_PROJECT:-nomos}"
+# Must resolve to the same project scripts/deploy_stack.sh:compose_project_name
+# produces, or these scripts address a project that does not exist. That is
+# COMPOSE_PROJECT_NAME, else the compose file's directory name ("deploy"). The
+# previous default of "nomos" never matched a deploy_stack.sh deployment, so
+# `dc run` joined an empty project and could not reach any backend.
+COMPOSE_PROJECT="${COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-$(basename "$ROOT_DIR/deploy")}}"
 
 if [ -t 1 ]; then
   C_B=$'\033[1m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_R=$'\033[31m'; C_0=$'\033[0m'
@@ -41,14 +39,49 @@ kc()    { kubectl --context "kind-${KIND_CLUSTER_NAME}" "$@"; }
 kcn()   { kubectl --context "kind-${KIND_CLUSTER_NAME}" -n "$NAMESPACE" "$@"; }
 helmc() { helm --kube-context "kind-${KIND_CLUSTER_NAME}" "$@"; }
 
-# docker compose wrapper: base + redis-sentinel + service overlays, env from deploy/.env,
-# the executor-openshell profile enabled. Used by the compose-* scripts.
+# docker compose wrapper: env from deploy/.env, the executor-openshell profile
+# enabled. Used by the compose-* scripts.
+#
+# The overlay set MUST mirror scripts/deploy_stack.sh:compose_file_args, because
+# these scripts act on whatever that deployed. This previously hard-coded
+# docker-compose.service.yml, which flips COUNCIL_STORAGE_MODE to postgres and
+# adds a postgres service. A default deploy uses the Redis/sentinel topology and
+# never starts postgres, so every compose-* helper addressed a backend that was
+# not running -- compose-register-agent.sh died with "failed to resolve host
+# 'postgres'". Select overlays from the same environment deploy_stack.sh reads.
 dc() {
+  local -a compose_files=(-f "$ROOT_DIR/deploy/docker-compose.yml")
+  # Resolve topology the way deploy_stack.sh does: environment, then ENV_FILE,
+  # then the default. deploy_stack.sh persists the choice into deploy/.env, so
+  # reading only the environment meant a later compose-down or compose-verify in
+  # a fresh shell assumed sentinel and addressed the wrong topology after a
+  # COMPOSE_REDIS_TOPOLOGY=standalone deploy.
+  local topology="${COMPOSE_REDIS_TOPOLOGY:-$(env_get COMPOSE_REDIS_TOPOLOGY)}"
+  case "${topology:-sentinel}" in
+    standalone) ;;
+    sentinel|"") compose_files+=(-f "$ROOT_DIR/deploy/docker-compose.redis-sentinel.yml") ;;
+    *) die "Unknown COMPOSE_REDIS_TOPOLOGY '${topology}'. Use standalone or sentinel." ;;
+  esac
+  if [[ -n "${COMPOSE_EXTRA_FILES:-}" ]]; then
+    local extra_file
+    local -a extra_files=()
+    IFS=: read -r -a extra_files <<<"$COMPOSE_EXTRA_FILES"
+    for extra_file in "${extra_files[@]}"; do
+      [[ -n "$extra_file" ]] && compose_files+=(-f "$extra_file")
+    done
+  fi
   docker compose -p "$COMPOSE_PROJECT" --env-file "$ENV_FILE" --profile executor-openshell \
-    -f "$ROOT_DIR/deploy/docker-compose.yml" \
-    -f "$ROOT_DIR/deploy/docker-compose.redis-sentinel.yml" \
-    -f "$ROOT_DIR/deploy/docker-compose.service.yml" \
-    "$@"
+    "${compose_files[@]}" "$@"
+}
+
+prepare_dynamic_config() {
+  COUNCIL_CONFIG_GID="${COUNCIL_CONFIG_GID:-$(env_get COUNCIL_CONFIG_GID)}"
+  COUNCIL_CONFIG_GID="${COUNCIL_CONFIG_GID:-$(id -g)}"
+  [[ "$COUNCIL_CONFIG_GID" =~ ^[0-9]+$ ]] || die "COUNCIL_CONFIG_GID must be a numeric group ID"
+  export COUNCIL_CONFIG_GID
+  "$DEV_LIB_DIR/prepare-dynamic-config.sh" "$1" "$COUNCIL_CONFIG_GID" || return $?
+  # Persist it so later Compose commands use the same supplementary group.
+  env_set COUNCIL_CONFIG_GID "$COUNCIL_CONFIG_GID"
 }
 
 # ── readiness waits with concise, actionable failures (Kind) ──────────────────
@@ -140,6 +173,12 @@ env_get() {
   sed -n "s/^${key}=//p" "$ENV_FILE" 2>/dev/null | tail -n1 | sed -e 's/^"//' -e 's/"$//'
 }
 
+needs_nvidia_api_key() {
+  [ -z "$(env_get NVIDIA_API_KEY)" ] \
+    && [ "${ALLOW_MISSING_NVIDIA_API_KEY:-0}" != "1" ] \
+    && [ "${ALLOW_MISSING_NVIDIA_API_KEY:-}" != "true" ]
+}
+
 # Write/replace KEY=VALUE in $ENV_FILE (created 0600 if missing). Unquoted values.
 env_set() {
   local key="$1" val="$2" tmp
@@ -158,13 +197,37 @@ env_set() {
   chmod 600 "$ENV_FILE" 2>/dev/null || true
 }
 
+percent_encode_uri_component() {
+  local value="$1" encoded="" char byte i
+  local LC_ALL=C
+  for ((i = 0; i < ${#value}; i++)); do
+    char="${value:i:1}"
+    case "$char" in
+      [a-zA-Z0-9.~_-]) encoded+="$char" ;;
+      *) printf -v byte '%%%02X' "'$char"; encoded+="$byte" ;;
+    esac
+  done
+  printf '%s' "$encoded"
+}
+
+sync_postgres_url_password() {
+  local password encoded
+  password="$(env_get POSTGRES_PASSWORD)"  # pragma: allowlist secret
+  [ -n "$password" ] || die "POSTGRES_PASSWORD is required for database URLs"  # pragma: allowlist secret
+  encoded="$(percent_encode_uri_component "$password")"
+  export POSTGRES_PASSWORD="$password"  # pragma: allowlist secret
+  export POSTGRES_PASSWORD_URLENCODED="$encoded"  # pragma: allowlist secret
+  env_set POSTGRES_PASSWORD_URLENCODED "$encoded"  # pragma: allowlist secret
+  unset password encoded
+}
+
 # prompt VAR "label" [default] [secret]
 # Non-interactive (NONINTERACTIVE=1 or no tty): uses the default silently.
 prompt() {
   local __var="$1" label="$2" default="${3:-}" secret="${4:-}" val=""
   if [ "${NONINTERACTIVE:-0}" = "1" ] || [ ! -t 0 ]; then
     val="$default"
-  elif [ "$secret" = "secret" ]; then
+  elif [ "$secret" = "secret" ]; then  # pragma: allowlist secret
     read -r -s -p "$label${default:+ [keep existing]}: " val; echo
     [ -z "$val" ] && val="$default"
   else
@@ -182,6 +245,24 @@ gen_or_keep() {
     cur="$(rand_secret)"; env_set "$key" "$cur"
   fi
   printf '%s' "$cur"
+}
+
+# Keep the retained postgres-data role in sync with the configured client secret.
+# Local socket authentication lets this run after Postgres is healthy even though
+# the volume still contains the previous password.
+sync_postgres_role_password() {
+  local password escaped
+  password="$(env_get POSTGRES_PASSWORD)"  # pragma: allowlist secret
+  [ -n "$password" ] || die "POSTGRES_PASSWORD is required for role password rotation"  # pragma: allowlist secret
+  # E'' literal, escaping backslashes BEFORE apostrophes. With
+  # standard_conforming_strings=off a backslash escapes the next character, so a
+  # password ending in \ would consume the closing quote and let the rest of the
+  # value run as SQL. Doubling apostrophes alone does not stop that.
+  escaped="$(printf '%s' "$password" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")"
+  printf "ALTER ROLE nomos WITH PASSWORD E'%s';\n" "$escaped" \
+    | dc exec -T postgres psql -v ON_ERROR_STOP=1 -U nomos -d nomos >/dev/null
+  unset password escaped
+  ok "Postgres role password synchronized"
 }
 
 # Set a fixed dev default for KEY only if currently unset.

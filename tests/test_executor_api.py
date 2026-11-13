@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for trusted executor HTTP API and agent binding checks."""
 
@@ -22,7 +14,7 @@ import urllib.request
 import pytest
 
 from executors.common import load_or_create_executor_identity
-from executors.docker.api import _validate_agent_binding, create_server
+from executors.docker.api import create_server
 from executors.docker.config import ExecutorConfig
 from executors.docker.models import ExecutionContext, WritOfExecution
 from trusted_executor_contract import (
@@ -32,6 +24,7 @@ from trusted_executor_contract import (
     WELL_KNOWN_ENDPOINT,
     ExecutionEvidence,
     ExecutionResult,
+    validate_agent_binding,
 )
 
 
@@ -55,34 +48,34 @@ def _writ_blob(target_agent_id: str = "agent-1") -> str:
 
 
 def test_missing_agent_header_returns_agent_binding_error():
-    err = _validate_agent_binding(_writ_blob(), caller_agent_id="")
+    err = validate_agent_binding(_writ_blob(), caller_agent_id="")
 
     assert err is not None
-    assert err["success"] is False
-    assert err["verification_stage"] == "agent_binding"
-    assert "X-Agent-ID" in err["error"]
+    assert err.success is False
+    assert err.verification_stage == "agent_binding"
+    assert "X-Agent-ID" in err.error
 
 
 def test_invalid_writ_payload_returns_agent_binding_error():
-    err = _validate_agent_binding("not-valid-base64", caller_agent_id="agent-1")
+    err = validate_agent_binding("not-valid-base64", caller_agent_id="agent-1")
 
     assert err is not None
-    assert err["success"] is False
-    assert err["verification_stage"] == "agent_binding"
+    assert err.success is False
+    assert err.verification_stage == "agent_binding"
 
 
 def test_agent_binding_mismatch_returns_agent_binding_error_with_writ_id():
-    err = _validate_agent_binding(_writ_blob(target_agent_id="agent-1"), caller_agent_id="agent-2")
+    err = validate_agent_binding(_writ_blob(target_agent_id="agent-1"), caller_agent_id="agent-2")
 
     assert err is not None
-    assert err["writ_id"] == "writ-1"
-    assert err["success"] is False
-    assert err["verification_stage"] == "agent_binding"
-    assert "mismatch" in err["error"].lower()
+    assert err.writ_id == "writ-1"
+    assert err.success is False
+    assert err.verification_stage == "agent_binding"
+    assert "mismatch" in err.error.lower()
 
 
 def test_agent_binding_match_passes():
-    err = _validate_agent_binding(_writ_blob(target_agent_id="agent-1"), caller_agent_id="agent-1")
+    err = validate_agent_binding(_writ_blob(target_agent_id="agent-1"), caller_agent_id="agent-1")
 
     assert err is None
 

@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """
 Permission model and intent categorization.
@@ -18,6 +10,7 @@ to required permission scopes based on command heuristics.
 
 import re
 import shlex
+from collections.abc import Iterable
 from enum import StrEnum
 
 from nomos.level_0.types import Intent
@@ -34,6 +27,85 @@ class PermissionScope(StrEnum):
     FILE_DELETE = "file:delete"  # Delete files
     INFRA_DEPLOY = "infra:deploy"  # Deploy infrastructure
     INFRA_DESTROY = "infra:destroy"  # Destroy infrastructure
+    TOOL_WRITE = "tool:write"  # Invoke an external application tool
+
+
+ALL_PERMISSIONS: tuple[str, ...] = tuple(scope.value for scope in PermissionScope)
+
+
+# ── Account roles ────────────────────────────────────────────────────
+# The canonical role → permission mapping. This lives in the package (rather
+# than in a script) so every account-provisioning entry point can import it:
+# the accounts CLI, the signup console, and the deploy registration wrappers
+# previously each carried their own copy, which drifted.
+#
+# infra:destroy is granted by exactly one preset role: admin, via
+# ALL_PERMISSIONS. readonly, developer, operator and demo all exclude it.
+# (An earlier version of this note said no preset role granted it, which was
+# false, and is exactly the sort of claim someone would rely on when picking
+# a role for an agent.)
+
+ROLE_PERMISSIONS: dict[str, tuple[str, ...]] = {
+    "readonly": (
+        PermissionScope.SHELL_READ.value,
+        PermissionScope.FILE_READ.value,
+    ),
+    "developer": (
+        PermissionScope.SHELL_READ.value,
+        PermissionScope.SHELL_WRITE.value,
+        PermissionScope.FILE_READ.value,
+        PermissionScope.FILE_WRITE.value,
+    ),
+    "operator": (
+        PermissionScope.SHELL_READ.value,
+        PermissionScope.SHELL_WRITE.value,
+        PermissionScope.FILE_READ.value,
+        PermissionScope.FILE_WRITE.value,
+        PermissionScope.INFRA_DEPLOY.value,
+    ),
+    # admin is the only role granting infra:destroy.
+    "admin": ALL_PERMISSIONS,
+    # demo mirrors developer; kept distinct so the demo persona can be
+    # re-scoped without affecting real developer accounts.
+    "demo": (
+        PermissionScope.SHELL_READ.value,
+        PermissionScope.SHELL_WRITE.value,
+        PermissionScope.FILE_READ.value,
+        PermissionScope.FILE_WRITE.value,
+    ),
+}
+
+
+class UnknownRoleError(ValueError):
+    """Raised when a role has no permission mapping."""
+
+
+class UnknownPermissionError(ValueError):
+    """Raised when a permission is not a known PermissionScope."""
+
+
+def permissions_for_role(role: str) -> tuple[str, ...]:
+    """Return the permission scopes granted by a preset role."""
+    try:
+        return ROLE_PERMISSIONS[role]
+    except KeyError as exc:
+        raise UnknownRoleError(
+            f"unknown role {role!r}. Known roles: {', '.join(sorted(ROLE_PERMISSIONS))}"
+        ) from exc
+
+
+def validate_permissions(permissions: Iterable[str]) -> tuple[str, ...]:
+    """Return the permissions sorted and de-duplicated, rejecting unknown scopes."""
+    requested = tuple(permissions)
+    invalid = sorted(set(requested) - set(ALL_PERMISSIONS))
+    if invalid:
+        raise UnknownPermissionError(
+            "unknown permission(s): "
+            + ", ".join(invalid)
+            + ". Known permissions: "
+            + ", ".join(ALL_PERMISSIONS)
+        )
+    return tuple(sorted(set(requested)))
 
 
 # ── Command classification patterns ──────────────────────────────────
@@ -234,6 +306,9 @@ def categorize_intent(intent: Intent) -> set[PermissionScope]:
     Set[PermissionScope]
         The set of permission scopes required for the intent.
     """
+    if intent.operation is not None:
+        return {PermissionScope.TOOL_WRITE}
+
     command = intent.command or (intent.parameters.get("command", "") if intent.parameters else "")
     action_type = intent.action_type
     perms: set[PermissionScope] = set()

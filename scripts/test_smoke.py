@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """
 Nomos — Integration Test
@@ -38,6 +30,9 @@ Usage:
 Requires:
     - Redis, council, and the default OpenShell executor running
     - Seeded accounts (python scripts/seed_accounts.py)
+    - MONITOR_MCP_PROXY_TOKEN in the environment when the monitor's /mcp proxy
+      is token-gated (the deploy scripts write it to deploy/.env; run via
+      scripts/run_test_suite.py or `uv run --env-file deploy/.env`)
 """
 
 import asyncio
@@ -50,6 +45,7 @@ import time
 import urllib.error
 import urllib.request
 
+from council_test_helpers import proxy_headers
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
@@ -73,6 +69,7 @@ SMOKE_PERMISSIONS = (
     "file:delete",
     "infra:deploy",
     "infra:destroy",
+    "tool:write",
 )
 SMOKE_COUNCIL_ID = "council-prod"
 
@@ -796,7 +793,7 @@ async def main():
     executor_ok = test_executor_health()
 
     try:
-        async with streamablehttp_client(MCP_URL) as (r, w, _):
+        async with streamablehttp_client(MCP_URL, headers=proxy_headers(MCP_URL)) as (r, w, _):
             async with ClientSession(r, w) as session:
                 mcp_ok = await test_connectivity(session)
                 if not mcp_ok:

@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """Thin async wrapper around the production Council MCP surface.
 
@@ -46,13 +38,16 @@ class CouncilClient:
     # traffic in its dashboard. Ignored by the council itself.
     _SOURCE_HEADERS: ClassVar[dict[str, str]] = {"X-Council-Source": "demo"}
 
-    def __init__(self, council_url: str):
+    def __init__(self, council_url: str, proxy_token: str = ""):
         self.council_url = council_url
+        self.headers = dict(self._SOURCE_HEADERS)
+        if proxy_token:
+            self.headers["Authorization"] = f"Bearer {proxy_token}"
 
     @asynccontextmanager
     async def session(self):
         """Yield an initialized MCP ClientSession against the council."""
-        async with streamablehttp_client(self.council_url, headers=self._SOURCE_HEADERS) as (
+        async with streamablehttp_client(self.council_url, headers=self.headers) as (
             read,
             write,
             _,
@@ -106,9 +101,12 @@ def _parse_tool_text(result: Any) -> dict[str, Any]:
     except (AttributeError, IndexError) as exc:
         raise RuntimeError(f"Unexpected MCP tool result shape: {result!r}") from exc
     try:
-        return json.loads(text)
+        payload = json.loads(text)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Tool returned non-JSON payload: {text!r}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Tool returned non-object JSON payload: {text!r}")
+    return payload
 
 
 def _summarize_exception(exc: BaseException) -> str:

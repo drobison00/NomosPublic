@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
+# SPDX-License-Identifier: Apache-2.0
 
 """Opt-in live tests for the deployed multi-council MCP API.
 
@@ -22,6 +14,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
@@ -62,12 +55,30 @@ EXPECTED_TOOLS = {
 }
 
 
+def _proxy_headers() -> dict[str, str]:
+    """Bearer header for the monitor's /mcp proxy, when one is configured.
+
+    The deploy scripts generate MONITOR_MCP_PROXY_TOKEN and the monitor rejects
+    unauthenticated requests once it is set, so a live suite that never sends the
+    header cannot reach its own deployment -- it fails with 401 before any product
+    behaviour is exercised. Empty when unset, which keeps an unauthenticated dev
+    proxy working unchanged.
+    """
+    token = os.environ.get("MONITOR_MCP_PROXY_TOKEN", "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 @asynccontextmanager
 async def live_session():
-    async with streamable_http_client(LIVE_MCP_URL) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            yield session
+    async with httpx.AsyncClient(timeout=120.0, headers=_proxy_headers()) as http_client:
+        async with streamable_http_client(LIVE_MCP_URL, http_client=http_client) as (
+            read,
+            write,
+            _,
+        ):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
 
 
 def _tool_payload(result: Any) -> dict[str, Any]:
@@ -184,6 +195,19 @@ async def test_live_multi_council_mcp_mutation_and_hot_reload():
             },
         )
         assert bad_token["success"] is False
+
+        # Under COUNCIL_STORAGE_MODE=postgres the catalog is served static and
+        # read-only: profile mutations would write replica-local YAML and diverge
+        # across council replicas, so they are refused before the token is even
+        # examined. That is an accepted degradation (NOMOS-4 in
+        # docs/proposals/08_pg_ha_cutover_outstanding_issues.md), not a failure —
+        # but it means the rest of this test cannot run against such a deployment.
+        if "postgres storage mode" in bad_token["error"]:
+            pytest.skip(
+                "deployment runs postgres storage mode; dynamic council mutation "
+                "is disabled there by design (NOMOS-4)"
+            )
+
         assert "Invalid or missing" in bad_token["error"]
 
         put_disabled = await _call(
